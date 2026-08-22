@@ -1,0 +1,74 @@
+// El indicador de actividad: una fibra que dibuja mientras la fibra principal espera.
+//
+// Funciona porque en la VM las esperas de verdad APARCAN la fibra —la petición HTTP y el
+// drenado de un proceso en streaming lo hacen— y el planificador aprovecha para dar el
+// turno al dibujante. Ojo: `process.run` (sin streaming) NO aparca, y por eso la
+// herramienta de shell usa `stream()`.
+//
+// Sin canal con espera limitada, el pulso se arma con una fibra por cuadro que duerme y
+// avisa: `select([stop, tick])` despierta con lo que llegue antes, la orden de parar o el
+// siguiente cuadro.
+import std/time;
+import src/ui;
+
+const FRAME_MS: int = 100;
+
+/// A running indicator. `active` is false when there is no terminal to draw on, and then
+/// everything here is a no-op — piped output stays clean.
+pub struct Spinner {
+    stop: Channel<int>,
+    done: Channel<int>,
+    active: bool,
+}
+
+fn frames() -> [string] {
+    ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+}
+
+// Borra la línea del indicador para que quien siga escriba sobre limpio.
+fn erase() {
+    ui.write_inline("\r" + ui.erase_line());
+}
+
+/// Starts drawing `label` until `stop_it` is called. The elapsed time is part of the
+/// indicator: a slow local model is not the same as a hung one.
+pub fn start(label: string) -> Spinner {
+    let stop: Channel<int> = Channel.new();
+    let done: Channel<int> = Channel.new();
+    if (!ui.interactive()) {
+        return Spinner { stop: stop, done: done, active: false };
+    }
+    spawn(fn() {
+        let started = time.monotonic();
+        let art = frames();
+        var frame = 0;
+        var spinning = true;
+        while (spinning) {
+            let tick: Channel<int> = Channel.new();
+            spawn(fn() {
+                time.sleep(FRAME_MS);
+                send(tick, 1);
+            });
+            if (select([stop, tick]) == 0) {
+                spinning = false;
+            } else {
+                let elapsed = ui.fmt_millis(time.monotonic() - started);
+                let glyph = art[frame - frame / art.len() * art.len()];
+                ui.write_inline("\r" + ui.erase_line() + ui.dim("${glyph} ${label} ${elapsed}"));
+                frame = frame + 1;
+            }
+        }
+        erase();
+        // El aviso de vuelta evita que el llamador escriba antes de que la línea se borre.
+        send(done, 1);
+    });
+    Spinner { stop: stop, done: done, active: true }
+}
+
+/// Stops the indicator and waits until its line is erased.
+pub fn stop_it(s: Spinner) {
+    if (s.active) {
+        send(s.stop, 1);
+        let _ = recv(s.done);
+    }
+}

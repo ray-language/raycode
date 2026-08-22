@@ -1,0 +1,61 @@
+// Contabilidad de uso: tokens, peticiones y latencia. El harness la acumula por
+// petición y la muestra por turno y en total (comando /usage).
+
+/// Token and latency accounting for one request, one turn, or the whole session.
+/// `measured` counts the requests whose endpoint reported token counts and `estimated`
+/// those the harness had to count itself, so a total never passes off a guess as a fact.
+pub struct Usage {
+    input_tokens: int,
+    output_tokens: int,
+    cached_tokens: int,
+    requests: int,
+    latency_ms: int,
+    measured: int,
+    estimated: int,
+}
+
+/// An empty accumulator.
+pub fn zero() -> Usage {
+    Usage {
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_tokens: 0,
+        requests: 0,
+        latency_ms: 0,
+        measured: 0,
+        estimated: 0
+    }
+}
+
+/// Field-wise sum of two accumulators.
+pub fn add(a: Usage, b: Usage) -> Usage {
+    Usage {
+        input_tokens: a.input_tokens + b.input_tokens,
+        output_tokens: a.output_tokens + b.output_tokens,
+        cached_tokens: a.cached_tokens + b.cached_tokens,
+        requests: a.requests + b.requests,
+        latency_ms: a.latency_ms + b.latency_ms,
+        measured: a.measured + b.measured,
+        estimated: a.estimated + b.estimated
+    }
+}
+
+/// True when no request in this accumulator got token counts from the endpoint: the
+/// figures shown are the harness's own estimate, not what the provider charged.
+pub fn is_estimate(u: Usage) -> bool {
+    u.measured == 0 && u.estimated > 0
+}
+
+/// Input plus output tokens (cached reads are already counted in the input).
+pub fn total_tokens(u: Usage) -> int {
+    u.input_tokens + u.output_tokens
+}
+
+/// Generation speed in output tokens per second, or 0.0 without a measured latency.
+pub fn output_speed(u: Usage) -> float {
+    if (u.latency_ms <= 0) {
+        0.0
+    } else {
+        u.output_tokens as float * 1000.0 / u.latency_ms as float
+    }
+}

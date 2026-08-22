@@ -1,0 +1,62 @@
+// El modelo canónico de conversación: independiente del formato de cada proveedor.
+// Los adaptadores (src/anthropic.ray, src/openai.ray) traducen desde/hacia estas
+// estructuras, así el bucle del agente no sabe con quién habla.
+
+from src/usage import Usage;
+
+/// A tool invocation requested by the model: `arguments` is the raw JSON object text.
+pub struct ToolCall {
+    id: string,
+    name: string,
+    arguments: string,
+}
+
+/// One conversation entry. `role` is "user", "assistant" or "tool".
+/// An assistant turn may carry `text`, `tool_calls`, or both.
+pub struct Message {
+    role: string,
+    text: string,
+    tool_calls: [ToolCall],
+    tool_call_id: string,
+    raw: string,
+}
+
+/// A user turn.
+pub fn user(text: string) -> Message {
+    let none: [ToolCall] = [];
+    Message { role: "user", text: text, tool_calls: none, tool_call_id: "", raw: "" }
+}
+
+/// An assistant turn (text and/or the tool calls it asked for).
+pub fn assistant(text: string, calls: [ToolCall]) -> Message {
+    Message { role: "assistant", text: text, tool_calls: calls, tool_call_id: "", raw: "" }
+}
+
+/// An assistant turn that also keeps the provider's own content blocks verbatim (`raw`),
+/// so protocols that require replaying them untouched — Anthropic thinking blocks and
+/// their signatures — can send back exactly what they produced.
+pub fn assistant_raw(text: string, calls: [ToolCall], raw: string) -> Message {
+    Message { role: "assistant", text: text, tool_calls: calls, tool_call_id: "", raw: raw }
+}
+
+/// The result of running a tool, answering the call with id `call_id`.
+pub fn tool_result(call_id: string, text: string) -> Message {
+    let none: [ToolCall] = [];
+    Message { role: "tool", text: text, tool_calls: none, tool_call_id: call_id, raw: "" }
+}
+
+/// True when the endpoint cut the answer at the token ceiling instead of letting the
+/// model finish — `length` in the OpenAI protocol, `max_tokens` in Anthropic's. It is the
+/// difference between "the model said this" and "the model was mid-sentence".
+pub fn was_truncated(stop_reason: string) -> bool {
+    stop_reason == "length" || stop_reason == "max_tokens"
+}
+
+/// What one provider round-trip produced: the assistant turn, what the endpoint reported
+/// about the model and why it stopped, and the tokens it charged.
+pub struct Reply {
+    message: Message,
+    usage: Usage,
+    stop_reason: string,
+    model: string,
+}

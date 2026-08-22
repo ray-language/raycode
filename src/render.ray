@@ -1,0 +1,254 @@
+// El renderizador: el AST de `std/markdown` pintado para un terminal.
+//
+// El parseo ya no es cosa nuestra —`markdown.parse` cubre CommonMark pragmático, listas
+// anidadas y tablas GFM—, así que aquí queda lo que sí es de la aplicación: el tema ANSI,
+// el reparto por ancho contando SOLO columnas visibles, y el ritmo vertical (aire
+// alrededor de lo que abre sección, nunca dos blancos seguidos, ninguno en los bordes).
+import std/markdown;
+from std/markdown import Block, Inline;
+import src/ui;
+
+const MIN_WIDTH: int = 24;
+
+/// The visible length of a string: like `len`, but skipping `ESC [ … m` sequences, which
+/// take no columns. It is what the wrapping and the table columns count.
+pub fn visible_len(s: string) -> int {
+    var count = 0;
+    var i = 0;
+    var skipping = false;
+    while (i < s.len()) {
+        let c = s.substring(i, i + 1);
+        if (skipping) {
+            if (c == "m") {
+                skipping = false;
+            }
+        } else if (char_code(c[0]) == 27) {
+            skipping = true;
+        } else {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    count
+}
+
+// Reparte por palabras hasta `width` columnas; las líneas siguientes llevan `indent`.
+// Una palabra más larga que la línea se deja desbordar: partirla sería peor.
+fn wrap(s: string, width: int, indent: string) -> [string] {
+    var lines: [string] = [];
+    if (width < MIN_WIDTH) {
+        lines.push(s);
+        return lines;
+    }
+    var current = "";
+    var used = 0;
+    for word in s.split(" ") {
+        let size = visible_len(word);
+        if (current == "") {
+            current = word;
+            used = size;
+        } else if (used + 1 + size <= width) {
+            current = current + " " + word;
+            used = used + 1 + size;
+        } else {
+            lines.push(current);
+            current = indent + word;
+            used = indent.len() + size;
+        }
+    }
+    if (current != "") {
+        lines.push(current);
+    }
+    lines
+}
+
+// `n` espacios.
+fn pad(n: int) -> string {
+    if (n <= 0) { "" } else { " ".repeat(n) }
+}
+
+/// Renders inline content (the body of headings, paragraphs and cells) with ANSI styling.
+pub fn inlines(items: [Inline]) -> string {
+    var out = "";
+    for item in items {
+        out = out + match (item) {
+            Inline.Text(t) => t,
+            Inline.Code(t) => ui.cyan(t),
+            Inline.Emph(inner) => ui.italic(inlines(inner)),
+            Inline.Strong(inner) => ui.bold(inlines(inner)),
+            Inline.Link(label, href) => ui.underline(inlines(label)) + ui.dim(" (${href})"),
+            Inline.Image(alt, src) => ui.dim("[image] ") + alt + ui.dim(" (${src})"),
+        };
+    }
+    out
+}
+
+// Una tabla, con las columnas alineadas al contenido más ancho de cada una.
+fn table_lines(aligns: [string], header: [[Inline]], rows: [[[Inline]]], width: int) -> [string] {
+    var head: [string] = [];
+    for cell in header {
+        head.push(inlines(cell));
+    }
+    var body: [[string]] = [];
+    for row in rows {
+        var painted: [string] = [];
+        for cell in row {
+            painted.push(inlines(cell));
+        }
+        body.push(painted);
+    }
+    // El ancho de cada columna es el de su celda más larga (en columnas visibles).
+    var widths: [int] = [];
+    var c = 0;
+    while (c < head.len()) {
+        var w = visible_len(head[c]);
+        for row in body {
+            if (c < row.len()) {
+                let size = visible_len(row[c]);
+                if (size > w) {
+                    w = size;
+                }
+            }
+        }
+        widths.push(w);
+        c = c + 1;
+    }
+    var lines: [string] = [];
+    lines.push(row_line(head, widths, aligns, true));
+    lines.push(rule_line(widths));
+    for row in body {
+        lines.push(row_line(row, widths, aligns, false));
+    }
+    lines
+}
+
+// Una fila: celdas rellenadas según su alineación y separadas por una barra tenue.
+fn row_line(cells: [string], widths: [int], aligns: [string], head: bool) -> string {
+    var parts: [string] = [];
+    var c = 0;
+    while (c < widths.len()) {
+        let raw = if (c < cells.len()) { cells[c] } else { "" };
+        let text = if (head) { ui.bold(raw) } else { raw };
+        let slack = widths[c] - visible_len(raw);
+        let align = if (c < aligns.len()) { aligns[c] } else { "" };
+        parts.push(if (align == "right") {
+            pad(slack) + text
+        } else if (align == "center") {
+            pad(slack / 2) + text + pad(slack - slack / 2)
+        } else {
+            text + pad(slack)
+        });
+        c = c + 1;
+    }
+    parts.join(ui.dim(" │ "))
+}
+
+// La línea que separa la cabecera del cuerpo.
+fn rule_line(widths: [int]) -> string {
+    var parts: [string] = [];
+    for w in widths {
+        parts.push("─".repeat(w));
+    }
+    ui.dim(parts.join("─┼─"))
+}
+
+// Las líneas de un bloque, ya repartidas a `width`.
+fn block_lines(b: Block, width: int) -> [string] {
+    match (b) {
+        Block.Heading(level, content) => {
+            // El nivel se ve en el color, no en almohadillas que nadie quiere leer.
+            let text = inlines(content);
+            let painted = if (level <= 2) { ui.bold(ui.cyan(text)) } else { ui.bold(text) };
+            wrap(painted, width, "")
+        },
+        Block.Paragraph(content) => wrap(inlines(content), width, ""),
+        Block.Code(language, text) => {
+            var lines: [string] = [];
+            lines.push(ui.dim("┌ ${language}"));
+            for line in text.split("\n") {
+                lines.push(ui.dim("│ ") + line);
+            }
+            lines.push(ui.dim("└"));
+            lines
+        },
+        Block.Quote(inner) => {
+            var lines: [string] = [];
+            for line in blocks_lines(inner, width - 2, true) {
+                lines.push(if (line == "") { ui.dim("▌") } else { ui.dim("▌ ") + ui.italic(line) });
+            }
+            lines
+        },
+        Block.Rule => {
+            var lines: [string] = [];
+            lines.push(ui.rule(width));
+            lines
+        },
+        Block.List(ordered, start, items) => list_lines(ordered, start, items, width),
+        Block.Table(aligns, header, rows) => table_lines(aligns, header, rows, width),
+    }
+}
+
+// Una lista: la viñeta (o el número) sangra la primera línea y el resto se alinea bajo
+// ella, así que una lista anidada cae naturalmente hacia dentro. Una lista ordenada empieza
+// donde diga el documento, no siempre en 1.
+fn list_lines(ordered: bool, start: int, items: [[Block]], width: int) -> [string] {
+    var lines: [string] = [];
+    var number = if (start > 0) { start } else { 1 };
+    for item in items {
+        let marker = if (ordered) { ui.yellow("${number}.") } else { ui.yellow("•") };
+        let indent = if (ordered) { "   " } else { "  " };
+        var first = true;
+        for line in blocks_lines(item, width - indent.len(), true) {
+            if (first) {
+                lines.push(marker + " " + line);
+                first = false;
+            } else if (line == "") {
+                lines.push("");
+            } else {
+                lines.push(indent + line);
+            }
+        }
+        number = number + 1;
+    }
+    lines
+}
+
+// ¿Abre sección este bloque? Es lo que decide el aire a su alrededor. Las listas y los
+// párrafos no lo hacen: su separación la marca el propio texto.
+fn breathes(b: Block) -> bool {
+    match (b) {
+        Block.Heading(_, _) => true,
+        Block.Rule => true,
+        Block.Code(_, _) => true,
+        Block.Table(_, _, _) => true,
+        _ => false,
+    }
+}
+
+// Los bloques, con el ritmo vertical entre ellos. En el cuerpo del documento cada bloque
+// va separado del siguiente; dentro de un ítem de lista NO, o la lista se desmadeja.
+fn blocks_lines(blocks: [Block], width: int, tight: bool) -> [string] {
+    var out: [string] = [];
+    var i = 0;
+    while (i < blocks.len()) {
+        let block = blocks[i];
+        let painted = block_lines(block, width);
+        if (out.len() > 0 && (!tight || breathes(block) || breathes(blocks[i - 1]))) {
+            out.push("");
+        }
+        for line in painted {
+            out.push(line);
+        }
+        i = i + 1;
+    }
+    out
+}
+
+/// Renders model output as terminal text: the full Markdown surface of `std/markdown`
+/// (headings, lists — nested and ordered —, quotes, fenced code, rules, GFM tables, links
+/// and images) painted with ANSI and wrapped to `width`.
+///
+/// With color disabled the markers simply disappear — the text stays readable.
+pub fn markdown_text(text: string, width: int) -> string {
+    blocks_lines(markdown.parse(text), width, false).join("\n")
+}

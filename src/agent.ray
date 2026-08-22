@@ -1,0 +1,473 @@
+// El bucle del agente: manda el historial al modelo, ejecuta las herramientas que pida y
+// repite hasta que conteste sin pedir ninguna (o hasta agotar `max_steps`).
+//
+// Cada paso —la petición y cada herramienta— corre en su propia fibra y el turno espera
+// por CANAL, no por retorno: así puede dejar de esperar. Una segunda fibra vigila el
+// teclado (el terminal está en modo crudo durante todo el turno) y manda "cancelado" si
+// llega ESC. Lo que se abandona sigue vivo hasta que termine solo; lo que no se abandona
+// es la conversación: las llamadas sin responder se cierran con un resultado sintético
+// para que el historial siga siendo válido en el siguiente turno.
+from src/config import Config;
+from src/message import Message, ToolCall, Reply;
+import src/message;
+from src/tools import Tool;
+import src/tools;
+from src/usage import Usage;
+import src/usage;
+import src/client;
+import src/render;
+import src/spinner;
+import std/term;
+import std/io;
+from std/term import Key;
+import src/ui;
+import std/time;
+
+// Cada cuánto se mira el teclado mientras se espera.
+const POLL_MS: int = 60;
+
+const EVENT_DONE: int = 0;
+
+const EVENT_CANCELLED: int = 1;
+
+// La tecla que aborta, y el Ctrl-C que en modo crudo llega como octeto en vez de señal.
+const KEY_ESCAPE: int = 27;
+
+const KEY_INTERRUPT: int = 3;
+
+/// A live conversation: its configuration, its tools, the transcript, and what it has
+/// cost so far.
+pub struct Session {
+    config: Config,
+    tools: [Tool],
+    history: [Message],
+    total: Usage,
+    turns: int,
+    steps: int,
+}
+
+// Lo que sale de un paso: hay respuesta, falló, o el usuario lo paró.
+enum Step {
+    Ready(Reply),
+    Failed(string),
+    Cancelled,
+}
+
+/// An empty session for `c`, with the tool registry its configuration allows.
+pub fn open(c: Config) -> Session {
+    let empty: [Message] = [];
+    Session {
+        config: c,
+        tools: tools.registry(c.allow_exec),
+        history: empty,
+        total: usage.zero(),
+        turns: 0,
+        steps: 0
+    }
+}
+
+/// Forgets the transcript (the configuration and the accumulated usage stay).
+pub fn reset(s: Session) {
+    let empty: [Message] = [];
+    s.history = empty;
+}
+
+// En modo crudo el terminal no traduce NINGÚN salto de línea: hay que devolver el carro a
+// mano, y también en los saltos de DENTRO del texto (la salida de una herramienta llega
+// en un solo bloque de varias líneas). Si no, cada línea empieza donde acabó la anterior
+// y el bloque sale en escalera.
+fn say(text: string, raw: bool) {
+    if (raw) {
+        ui.write_inline(ui.crlf(text));
+    } else {
+        print(text);
+    }
+}
+
+// ¿Pide el usuario parar? ESC a secas o Ctrl-C. Una flecha TAMBIÉN empieza por ESC, así
+// que el trozo se decodifica en vez de mirar el octeto: `term.decode` distingue la tecla
+// Esc de una secuencia CSI. Un ESC suelto queda como prefijo incompleto — y suelto, en un
+// trozo que ya llegó entero, es exactamente la tecla Esc.
+fn cancels(chunk: bytes) -> bool {
+    match (term.decode(chunk)) {
+        Option.Some(decoded) => match (decoded.0) {
+            Key.Esc => true,
+            Key.Ctrl(c) => c == 'c',
+            _ => false,
+        },
+        Option.None => chunk == b"\x1b",
+    }
+}
+
+// Vigila el teclado mientras otra fibra trabaja. El sondeo es puro (plazo 0: no aparca) y
+// el pulso lo pone una fibra que duerme, para poder atender también la orden de parar:
+// `select` sobre [parar, pulso].
+fn watch_keys(events: Channel<Signal>, stop: Channel<int>) {
+    var watching = true;
+    while (watching) {
+        let tick: Channel<int> = Channel.new();
+        spawn(fn() {
+            time.sleep(POLL_MS);
+            send(tick, 1);
+        });
+        if (select([stop, tick]) == 0) {
+            watching = false;
+        } else {
+            match (io.read_timeout(64, 0)) {
+                io.ReadResult.Data(chunk) => {
+                    if (cancels(chunk)) {
+                        send(events, Signal.Cancelled);
+                        watching = false;
+                    }
+                },
+                io.ReadResult.Eof => {
+                    watching = false;
+                },
+                io.ReadResult.TimedOut => { },
+            }
+        }
+    }
+}
+
+// ¿Terminó el trabajo, o el usuario pulsó ESC? Devuelve true si hay que cancelar.
+fn wait_for(signals: Channel<Signal>, stop: Channel<int>) -> bool {
+    let signal = recv(signals);
+    // El vigilante se retira: su fibra no debe sobrevivir al paso que vigilaba.
+    send(stop, 1);
+    match (signal) {
+        Option.Some(what) => match (what) {
+            Signal.Cancelled => true,
+            _ => false,
+        },
+        Option.None => false,
+    }
+}
+
+// Lo que la fibra trabajadora le cuenta al turno mientras trabaja.
+enum Signal {
+    Text(string),
+    Done,
+    Cancelled,
+}
+
+// Una petición al modelo, cancelable. La fibra trabajadora recibe una copia de la sesión
+// (los heaps de las fibras son independientes), así que solo lee: no muta nada.
+//
+// El texto que llega se PINTA EN ESTA FIBRA, no en la trabajadora: así, al cancelar, deja
+// de pintarse en el acto — una fibra abandonada seguiría escribiendo sobre el prompt.
+fn call_model(s: Session, label: string, width: int, raw: bool, watch: bool) -> Step {
+    let signals: Channel<Signal> = Channel.new();
+    let stop: Channel<int> = Channel.new();
+    let box: Channel<Result<Reply, string>> = Channel.new();
+    let streaming = s.config.stream;
+    spawn(fn() {
+        // Bajo `try_call`: si la fibra trabajadora muriera de un panic, nadie avisaría al
+        // canal y el turno esperaría para siempre. Un fallo tiene que ser un valor.
+        let guarded = try_call(fn() -> Result<Reply, string> {
+            if (streaming) {
+                client.send_stream(s.config, s.tools, s.history, fn(piece: string) {
+                    send(signals, Signal.Text(piece));
+                })
+            } else {
+                client.send(s.config, s.tools, s.history)
+            }
+        });
+        let outcome: Result<Reply, string> = match (guarded) {
+            Result.Ok(sent) => sent,
+            Result.Err(e) => Result.Err("the request failed: ${e}"),
+        };
+        send(box, outcome);
+        send(signals, Signal.Done);
+    });
+    if (watch) {
+        spawn(fn() {
+            watch_keys(signals, stop);
+        });
+    }
+    let waiting = spinner.start(label);
+    var spinning = true;
+    var cancelled = false;
+    let brush = painter(width, raw);
+    var listening = true;
+    while (listening) {
+        match (recv(signals)) {
+            Option.None => {
+                listening = false;
+            },
+            Option.Some(signal) => match (signal) {
+                Signal.Text(piece) => {
+                    // El indicador dura hasta el primer token: a partir de ahí manda el texto.
+                    if (spinning) {
+                        spinner.stop_it(waiting);
+                        spinning = false;
+                    }
+                    feed(brush, piece);
+                },
+                Signal.Done => {
+                    listening = false;
+                },
+                Signal.Cancelled => {
+                    cancelled = true;
+                    listening = false;
+                },
+            },
+        }
+    }
+    // El vigilante se retira: su fibra no debe sobrevivir al paso que vigilaba.
+    send(stop, 1);
+    if (spinning) {
+        spinner.stop_it(waiting);
+    }
+    if (cancelled) {
+        return Step.Cancelled;
+    }
+    flush(brush);
+    match (recv(box)) {
+        Option.None => Step.Failed("the request fiber produced nothing"),
+        Option.Some(outcome) => match (outcome) {
+            Result.Ok(reply) => Step.Ready(reply),
+            Result.Err(e) => Step.Failed(e),
+        },
+    }
+}
+
+// Una herramienta, cancelable igual. `None` = el usuario paró la espera.
+fn call_tool(s: Session, call: ToolCall, watch: bool) -> Option<string> {
+    let signals: Channel<Signal> = Channel.new();
+    let stop: Channel<int> = Channel.new();
+    let box: Channel<string> = Channel.new();
+    spawn(fn() {
+        let guarded = try_call(fn() -> string {
+            tools.execute(s.tools, call.name, call.arguments)
+        });
+        let result = match (guarded) {
+            Result.Ok(text) => text,
+            Result.Err(e) => "error: the tool fiber failed (${e})",
+        };
+        send(box, result);
+        send(signals, Signal.Done);
+    });
+    if (watch) {
+        spawn(fn() {
+            watch_keys(signals, stop);
+        });
+    }
+    let running = spinner.start(hint("running ${call.name}", watch));
+    let cancelled = wait_for(signals, stop);
+    spinner.stop_it(running);
+    if (cancelled) {
+        return Option.None;
+    }
+    recv(box)
+}
+
+// La etiqueta del indicador, con el recordatorio de que se puede parar.
+fn hint(label: string, watch: bool) -> string {
+    if (watch) { "${label} · esc to stop" } else { label }
+}
+
+// El pintor de una respuesta que llega por trozos. El Markdown no se puede renderizar a
+// medias —una lista o una cerca de código no significan nada hasta que cierran—, así que
+// se acumula y se vuelca por BLOQUES: en cuanto hay una línea en blanco fuera de una
+// cerca, ese trozo ya es un documento completo y se pinta.
+struct Painter {
+    buffer: string,
+    scanned: int,
+    fences: int,
+    width: int,
+    raw: bool,
+    started: bool,
+}
+
+fn painter(width: int, raw: bool) -> Painter {
+    Painter { buffer: "", scanned: 0, fences: 0, width: width, raw: raw, started: false }
+}
+
+// Recorre SOLO lo que aún no se había mirado: así el coste es lineal aunque la respuesta
+// sea larga. Devuelve el corte (0 = todavía no hay bloque cerrado).
+fn feed(p: Painter, piece: string) {
+    p.buffer = p.buffer + piece;
+    var cut = 0;
+    var i = p.scanned;
+    while (i + 1 < p.buffer.len()) {
+        if (p.buffer.substring(i, i + 3) == "```") {
+            p.fences = p.fences + 1;
+        }
+        if (p.buffer.substring(i, i + 2) == "\n\n" && p.fences - p.fences / 2 * 2 == 0) {
+            cut = i + 2;
+        }
+        i = i + 1;
+    }
+    p.scanned = if (p.buffer.len() > 1) { p.buffer.len() - 1 } else { 0 };
+    if (cut > 0) {
+        let ready = p.buffer.substring(0, cut);
+        p.buffer = p.buffer.substring(cut, p.buffer.len());
+        p.scanned = 0;
+        p.fences = 0;
+        paint(p, ready);
+    }
+}
+
+// Lo que quede al terminar el flujo.
+fn flush(p: Painter) {
+    if (p.buffer.trim() != "") {
+        paint(p, p.buffer);
+    }
+    p.buffer = "";
+    p.scanned = 0;
+    p.fences = 0;
+}
+
+// Un bloque ya cerrado, pintado bajo la viñeta (solo el primero la lleva).
+fn paint(p: Painter, text: string) {
+    // El ancho se vuelve a medir por bloque: si la ventana cambia a mitad de respuesta, lo
+    // que quede por pintar sale ya al tamaño nuevo.
+    let body = render.markdown_text(text.trim(), ui.width() - 2);
+    for line in body.split("\n") {
+        if (!p.started) {
+            say(ui.cyan("⏺ ") + line, p.raw);
+            p.started = true;
+        } else if (line == "") {
+            say("", p.raw);
+        } else {
+            say("  " + line, p.raw);
+        }
+    }
+    say("", p.raw);
+}
+
+// Una línea por llamada a herramienta, con los argumentos recortados.
+fn show_call(name: string, arguments: string, raw: bool) {
+    say(ui.yellow("⚙ ") + ui.bold(name) + ui.dim(" " + ui.clip(arguments.trim(), 160)), raw);
+}
+
+// El resultado, sangrado y recortado: el modelo lo ve entero, el usuario un resumen.
+fn show_result(text: string, raw: bool) {
+    say(ui.dim(ui.indent(ui.clip(text.trim(), 400), "  │ ")), raw);
+}
+
+// La respuesta del modelo, con su Markdown pintado y sangrada bajo la viñeta.
+fn show_answer(text: string, width: int, raw: bool) {
+    var first = true;
+    for line in render.markdown_text(text, width - 2).split("\n") {
+        if (first) {
+            say(ui.cyan("⏺ ") + line, raw);
+            first = false;
+        } else if (line == "") {
+            say("", raw);
+        } else {
+            say("  " + line, raw);
+        }
+    }
+}
+
+// Cierra las llamadas que quedaron sin responder. Un `tool_use` sin su `tool_result`
+// invalida el historial para el siguiente turno (Anthropic lo rechaza), y además el
+// modelo merece enterarse de que le pararon.
+fn close_pending(s: Session, calls: [ToolCall], start: int) {
+    var i = start;
+    while (i < calls.len()) {
+        s.history.push(message.tool_result(calls[i].id, "stopped by the user"));
+        i = i + 1;
+    }
+}
+
+// El bucle en sí. Va aparte de `ask` para que el modo crudo se restaure en un solo sitio,
+// pase lo que pase aquí dentro.
+fn run_turn(s: Session, width: int, raw: bool) -> Result<Usage, string> {
+    var turn = usage.zero();
+    var step = 0;
+    while (step < s.config.max_steps) {
+        step = step + 1;
+        s.steps = s.steps + 1;
+        let label = if (step == 1) { "thinking" } else { "thinking · step ${step}" };
+        match (call_model(
+        s,
+        hint(label, raw),
+        width,
+        raw,
+        raw
+    )) {
+            Step.Cancelled => {
+                say(ui.yellow("■ ") + ui.dim("stopped by the user"), raw);
+                say("", raw);
+                return Result.Ok(turn);
+            },
+            Step.Failed(e) => {
+                return Result.Err(e);
+            },
+            Step.Ready(reply) => {
+                turn = usage.add(turn, reply.usage);
+                s.total = usage.add(s.total, reply.usage);
+                s.history.push(reply.message);
+                let calls = reply.message.tool_calls;
+                // Con streaming la respuesta ya se pintó mientras llegaba.
+                if (!s.config.stream && reply.message.text.trim() != "") {
+                    show_answer(reply.message.text.trim(), width, raw);
+                    say("", raw);
+                }
+                if (message.was_truncated(
+                    reply.stop_reason
+                )) {
+                    // El modelo no terminó: se quedó sin cupo. Decirlo importa, porque la
+                    // respuesta parece completa hasta que se lee el final.
+                    say(
+                        ui.yellow("! ") + "the answer hit the ${s.config.max_tokens}-token ceiling; raise it with /set max-tokens N",
+                        raw
+                    );
+                    say("", raw);
+                }
+                if (calls.len() == 0) {
+                    return Result.Ok(turn);
+                }
+                var i = 0;
+                while (i < calls.len()) {
+                    let call = calls[i];
+                    show_call(call.name, call.arguments, raw);
+                    match (call_tool(s, call, raw)) {
+                        Option.None => {
+                            close_pending(s, calls, i);
+                            say(ui.yellow("■ ") + ui.dim("stopped by the user"), raw);
+                            say("", raw);
+                            return Result.Ok(turn);
+                        },
+                        Option.Some(result) => {
+                            show_result(result, raw);
+                            say("", raw);
+                            s.history.push(message.tool_result(call.id, result));
+                        },
+                    }
+                    i = i + 1;
+                }
+            },
+        }
+    }
+    say(ui.red("! ") + "stopped after ${s.config.max_steps} tool steps (raise --max-steps)", raw);
+    Result.Ok(turn)
+}
+
+/// Runs one user turn to completion: the model may call tools any number of times (up to
+/// `max_steps`), every intermediate step is shown as it happens, and ESC stops the turn
+/// wherever it is. Returns what the turn consumed; the session's running total is updated
+/// too.
+pub fn ask(s: Session, prompt: string) -> Result<Usage, string> {
+    s.history.push(message.user(prompt));
+    s.turns = s.turns + 1;
+    // El ancho se mide una vez por turno, y antes de arrancar ninguna fibra: la consulta
+    // lanza un proceso y eso bloquea el planificador un instante.
+    let width = ui.width();
+    // Aire entre lo que acaba de escribir el usuario y lo que va a contestar el modelo.
+    print("");
+    if (!ui.interactive()) {
+        return run_turn(s, width, false);
+    }
+    // El modo crudo dura todo el turno: es lo que hace que el ESC llegue en el momento, en
+    // vez de quedarse en el búfer de línea hasta el siguiente Enter. `term.raw` lo restaura
+    // pase lo que pase dentro —incluido un panic— y también al salir el proceso.
+    match (term.raw(fn() -> Result<Usage, string> {
+    run_turn(s, width, true)
+})) {
+        Result.Ok(outcome) => outcome,
+        Result.Err(e) => Result.Err("the turn failed: ${e}"),
+    }
+}

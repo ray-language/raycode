@@ -1,0 +1,543 @@
+// El editor de línea del REPL: edición estilo readline, historial persistente y
+// autocompletado con Tab.
+//
+// Todo lo que toca el terminal —modo crudo, teclas, tamaño— viene de `std/term`: `raw`
+// restaura el modo SIEMPRE (también si el cuerpo falla, y al salir el proceso), y
+// `read_key` entrega teclas ya decodificadas, aparcando solo esta fibra mientras espera.
+import std/fs;
+import std/term;
+import std/io;
+from std/term import Key;
+import src/ui;
+
+const HISTORY_LIMIT: int = 500;
+
+// Cada cuánto se despierta la espera de tecla para mirar si la ventana cambió.
+const IDLE_MS: int = 250;
+
+/// The line editor: the terminal state to restore, the history, and whether the terminal
+/// can be driven at all (`tty`); when it cannot, reading falls back to `input()`.
+pub struct Editor {
+    tty: bool,
+    history: [string],
+    history_path: string,
+}
+
+// El historial guardado, si lo hay. Un archivo inexistente no es un error: se empieza vacío.
+fn load_history(path: string) -> [string] {
+    var lines: [string] = [];
+    if (path == "" || !fs.exists(path)) {
+        return lines;
+    }
+    match (fs.read_file(path)) {
+        Result.Err(_) => lines,
+        Result.Ok(text) => {
+            for line in text.split("\n") {
+                if (line.trim() != "") {
+                    lines.push(line);
+                }
+            }
+            lines
+        },
+    }
+}
+
+// Añade la línea al archivo de historial (best effort: si no se puede, la sesión sigue).
+fn append_history(e: Editor, line: string) {
+    if (e.history_path == "") {
+        return;
+    }
+    match (fs.append_file(e.history_path, line + "\n")) {
+        Result.Ok(_) => { },
+        Result.Err(_) => { },
+    }
+}
+
+/// The default history file: `$RAYCODE_HISTORY`, else `~/.raycode_history`, else none.
+pub fn default_history_path() -> string {
+    match (env("RAYCODE_HISTORY")) {
+        Option.Some(p) => p,
+        Option.None => match (env("HOME")) {
+            Option.Some(h) => h + "/.raycode_history",
+            Option.None => "",
+        },
+    }
+}
+
+/// Opens the editor: checks that there is a terminal to drive and loads the history.
+/// With no terminal, `tty` is false and everything degrades to plain line reading.
+pub fn open(history_path: string) -> Editor {
+    Editor {
+        tty: ui.interactive(),
+        history: load_history(history_path),
+        history_path: history_path
+    }
+}
+
+// El lector de teclas: guarda lo que sobró del último trozo leído.
+//
+// No se usa `term.read_key` porque descarta lo que venga detrás de la tecla que decodifica
+// (así lo documenta), y al pegar —o al teclear rápido— llega un trozo con varias teclas
+// dentro: se perderían todas menos la primera. Aquí se decodifica el trozo ENTERO.
+struct Reader {
+    pending: bytes,
+}
+
+// Lo que devuelve una espera de tecla: una tecla, nada (se agotó el plazo) o el fin.
+enum Input {
+    Pressed(Key),
+    Idle,
+    Done,
+}
+
+// La siguiente tecla, leyendo del terminal solo cuando no queda nada por decodificar. La
+// espera tiene plazo para poder atender otra cosa mientras no se teclea — hoy, mirar si la
+// ventana ha cambiado de tamaño.
+fn next_key(r: Reader, idle_ms: int) -> Input {
+    while (true) {
+        if (r.pending.len() == 0) {
+            match (io.read_timeout(512, idle_ms)) {
+                io.ReadResult.Data(chunk) => {
+                    r.pending = chunk;
+                },
+                io.ReadResult.TimedOut => {
+                    return Input.Idle;
+                },
+                io.ReadResult.Eof => {
+                    return Input.Done;
+                },
+            }
+        } else {
+            match (term.decode(r.pending)) {
+                Option.Some(decoded) => {
+                    r.pending = r.pending.sub_bytes(decoded.1, r.pending.len());
+                    return Input.Pressed(decoded.0);
+                },
+                Option.None => {
+                    // Prefijo incompleto: o falta el resto de una secuencia, o es un ESC
+                    // suelto. Un humano no teclea el `[` de una flecha en 25 ms.
+                    match (io.read_timeout(512, 25)) {
+                        io.ReadResult.Data(more) => {
+                            r.pending = r.pending + more;
+                        },
+                        io.ReadResult.TimedOut => {
+                            let alone = r.pending == b"\x1b";
+                            r.pending = b"";
+                            if (alone) {
+                                return Input.Pressed(Key.Esc);
+                            }
+                        },
+                        io.ReadResult.Eof => {
+                            return Input.Done;
+                        },
+                    }
+                },
+            }
+        }
+    }
+    Input.Done
+}
+
+// Una escritura por refresco: en modo crudo el cursor se coloca a mano y hacerlo en
+// varios trozos parpadea.
+fn emit(s: string) {
+    ui.write_inline(s);
+}
+
+// El índice del último `needle` en `s`, o -1. (`index_of` da el primero.)
+fn last_index_of(s: string, needle: string) -> int {
+    var found = -1;
+    var i = 0;
+    while (i + needle.len() <= s.len()) {
+        if (s.substring(i, i + needle.len()) == needle) {
+            found = i;
+        }
+        i = i + 1;
+    }
+    found
+}
+
+// El inicio de la palabra que se está escribiendo (lo que hay tras el último espacio).
+fn word_start(line: string, cursor: int) -> int {
+    let head = line.substring(0, cursor);
+    last_index_of(head, " ") + 1
+}
+
+// Los candidatos de ruta para `word`: se lista su directorio y se filtra por el prefijo.
+// Los directorios se completan con `/` para poder seguir bajando con otro Tab.
+fn path_candidates(word: string) -> [string] {
+    var out: [string] = [];
+    let cut = last_index_of(word, "/");
+    let dir = if (cut < 0) { "" } else { word.substring(0, cut + 1) };
+    let prefix = word.substring(cut + 1, word.len());
+    // Se lista el espacio de trabajo (el directorio desde el que se lanzó raycode), pero lo
+    // que se inserta en la línea es lo que el usuario escribió: rutas relativas a él.
+    let listing = ui.resolve_path(if (dir == "") { "." } else { dir });
+    match (fs.list_dir(listing)) {
+        Result.Err(_) => out,
+        Result.Ok(entries) => {
+            for entry in entries {
+                // Los ocultos solo aparecen si se pidieron con un punto explícito.
+                if (entry.starts_with(
+                prefix
+            ) && (!entry.starts_with(".") || prefix.starts_with("."))) {
+                    let full = dir + entry;
+                    if (fs.is_dir(ui.resolve_path(full))) {
+                        out.push(full + "/");
+                    } else {
+                        out.push(full);
+                    }
+                }
+            }
+            out.sort()
+        },
+    }
+}
+
+/// The candidates for the word being typed: slash commands in the first position, paths
+/// everywhere else. Public so the tests can pin the behaviour down.
+pub fn candidates(line: string, cursor: int, commands: [string]) -> [string] {
+    let start = word_start(line, cursor);
+    let word = line.substring(start, cursor);
+    // En primera posición una barra abre la lista de órdenes… salvo que no case ninguna,
+    // en cuyo caso la palabra era una ruta absoluta (`/tmp/…`) y se completa como tal.
+    if (start == 0 && word.starts_with("/") && !word.substring(1, word.len()).contains("/")) {
+        var out: [string] = [];
+        for c in commands {
+            if (c.starts_with(word)) {
+                out.push(c);
+            }
+        }
+        if (out.len() > 0) {
+            return out.sort();
+        }
+    }
+    path_candidates(word)
+}
+
+/// The longest prefix shared by every candidate (what a Tab can safely insert).
+pub fn common_prefix(items: [string]) -> string {
+    if (items.len() == 0) {
+        return "";
+    }
+    var prefix = items[0];
+    for item in items {
+        var i = 0;
+        while (i < prefix.len() && i < item.len() && prefix.substring(
+            i,
+            i + 1
+        ) == item.substring(i, i + 1)) {
+            i = i + 1;
+        }
+        prefix = prefix.substring(0, i);
+    }
+    prefix
+}
+
+// Los últimos `count` elementos (el historial en memoria no crece sin fin).
+fn tail(items: [string], count: int) -> [string] {
+    var out: [string] = [];
+    var i = if (items.len() > count) { items.len() - count } else { 0 };
+    while (i < items.len()) {
+        out.push(items[i]);
+        i = i + 1;
+    }
+    out
+}
+
+// El estado visible, repintado sobre TODAS las filas que ocupa. Una línea más ancha que
+// el terminal se envuelve, y entonces no basta con limpiar la fila actual: hay que subir
+// hasta el principio del bloque, borrar de ahí hacia abajo y volver a pintarlo entero.
+// Devuelve la fila (relativa al principio del bloque) donde queda el cursor, que es lo
+// que el siguiente repintado necesita para subir.
+fn redraw(prompt: string, line: string, cursor: int, width: int, previous_row: int) -> int {
+    var out = "";
+    if (previous_row > 0) {
+        out = out + ui.cursor_up(previous_row);
+    }
+    out = out + "\r" + ui.erase_below() + ui.green(prompt) + line;
+    let total = prompt.len() + line.len();
+    var last_row = total / width;
+    if (total > 0 && total - last_row * width == 0) {
+        // El texto acaba justo en el borde: el terminal deja el cursor "colgando" al final
+        // de la fila en vez de saltar. Se fuerza el salto para que la cuenta cuadre.
+        out = out + "\r\n";
+    }
+    let target = prompt.len() + cursor;
+    let target_row = target / width;
+    let target_col = target - target_row * width;
+    if (last_row > target_row) {
+        out = out + ui.cursor_up(last_row - target_row);
+    }
+    out = out + "\r";
+    if (target_col > 0) {
+        out = out + ui.cursor_right(target_col);
+    }
+    emit(out);
+    target_row
+}
+
+// Baja hasta la última fila del bloque y salta de línea: lo que hay que hacer antes de
+// escribir cualquier otra cosa, o el texto caería encima del resto de la línea envuelta.
+fn leave_block(prompt: string, line: string, width: int, row: int) {
+    let last_row = (prompt.len() + line.len()) / width;
+    var out = "";
+    if (last_row > row) {
+        out = out + ui.cursor_down(last_row - row);
+    }
+    emit(out + "\r\n");
+}
+
+// La lista de candidatos, en una línea suelta sobre el prompt.
+fn show_candidates(items: [string]) {
+    var shown: [string] = [];
+    var i = 0;
+    while (i < items.len() && i < 40) {
+        shown.push(items[i]);
+        i = i + 1;
+    }
+    if (items.len() > shown.len()) {
+        shown.push("… ${items.len() - shown.len()} more");
+    }
+    emit(ui.dim(shown.join("  ")) + "\r\n");
+}
+
+// Sustituye la palabra bajo el cursor por `text`. Devuelve la línea nueva; el cursor
+// queda al final de lo insertado.
+fn replace_word(line: string, cursor: int, text: string) -> string {
+    let start = word_start(line, cursor);
+    line.substring(0, start) + text + line.substring(cursor, line.len())
+}
+
+/// Reads one line with editing, history and Tab completion. `None` means end of input
+/// (Ctrl-D on an empty line, or EOF on a pipe). Without a terminal it degrades to
+/// `input()`, so pipelines and `ray test` keep working.
+pub fn read_line(e: Editor, prompt: string, commands: [string]) -> Option<string> {
+    if (!e.tty) {
+        emit(ui.green(prompt));
+        return input();
+    }
+    // `term.raw` devuelve el modo anterior pase lo que pase dentro (y al salir el proceso).
+    match (term.raw(fn() -> Option<string> {
+    edit(e, prompt, commands)
+})) {
+        Result.Ok(line) => line,
+        Result.Err(_) => {
+            // Sin modo crudo no hay edición posible: se lee la línea a pelo.
+            emit(ui.green(prompt));
+            input()
+        },
+    }
+}
+
+// El bucle de edición, ya en modo crudo. El ancho se vuelve a medir en cada tecla: así
+// redimensionar la ventana se recoge en cuanto el usuario escribe algo, sin señales.
+fn edit(e: Editor, prompt: string, commands: [string]) -> Option<string> {
+    var line = "";
+    var cursor = 0;
+    // Posición en el historial: `len` = la línea que se está escribiendo ahora.
+    var index = e.history.len();
+    var stash = "";
+    var width = ui.width();
+    var row = redraw(prompt, line, cursor, width, 0);
+    let reader = Reader { pending: b"" };
+    while (true) {
+        let pressed = next_key(reader, IDLE_MS);
+        let measured = ui.width();
+        if (measured != width) {
+            // La ventana cambió de tamaño: se repinta al ancho nuevo antes de nada.
+            width = measured;
+            row = redraw(prompt, line, cursor, width, row);
+        }
+        match (pressed) {
+            Input.Idle => { },
+            Input.Done => {
+                leave_block(prompt, line, width, row);
+                return Option.None;
+            },
+            Input.Pressed(key) => {
+                match (key) {
+                    Key.Enter => {
+                        leave_block(prompt, line, width, row);
+                        let text = line;
+                        if (text.trim() != "") {
+                            e.history.push(text);
+                            if (e.history.len() > HISTORY_LIMIT) {
+                                e.history = tail(e.history, HISTORY_LIMIT);
+                            }
+                            append_history(e, text);
+                        }
+                        return Option.Some(text);
+                    },
+                    Key.Ctrl(c) => {
+                        if (c == 'd' && line == "") {
+                            leave_block(prompt, line, width, row);
+                            return Option.None;
+                        }
+                        row = control(e, c, prompt, width, row);
+                        // `control` no puede devolver varios valores, así que el estado
+                        // que toca vive aquí: se aplica según la tecla.
+                        if (c == 'd') {
+                            if (cursor < line.len()) {
+                                line = line.substring(
+                                    0,
+                                    cursor
+                                ) + line.substring(cursor + 1, line.len());
+                            }
+                        } else if (c == 'b') {
+                            if (cursor > 0) {
+                                cursor = cursor - 1;
+                            }
+                        } else if (c == 'f') {
+                            if (cursor < line.len()) {
+                                cursor = cursor + 1;
+                            }
+                        } else if (c == 'a') {
+                            cursor = 0;
+                        } else if (c == 'e') {
+                            cursor = line.len();
+                        } else if (c == 'u') {
+                            line = line.substring(cursor, line.len());
+                            cursor = 0;
+                        } else if (c == 'k') {
+                            line = line.substring(0, cursor);
+                        } else if (c == 'w') {
+                            let start = word_boundary(line, cursor);
+                            line = line.substring(0, start) + line.substring(cursor, line.len());
+                            cursor = start;
+                        } else if (c == 'c') {
+                            line = "";
+                            cursor = 0;
+                            index = e.history.len();
+                            row = 0;
+                        } else if (c == 'l') {
+                            row = 0;
+                        }
+                        row = redraw(prompt, line, cursor, width, row);
+                    },
+                    Key.Tab => {
+                        let options = candidates(line, cursor, commands);
+                        if (options.len() == 1) {
+                            let single = options[0];
+                            let completed = if (single.ends_with(
+                                "/"
+                            )) { single } else { single + " " };
+                            line = replace_word(line, cursor, completed);
+                            cursor = word_start(line, cursor) + completed.len();
+                            row = redraw(prompt, line, cursor, width, row);
+                        } else if (options.len() > 1) {
+                            let shared = common_prefix(options);
+                            let start = word_start(line, cursor);
+                            let word = line.substring(start, cursor);
+                            if (shared.len() > word.len()) {
+                                line = replace_word(line, cursor, shared);
+                                cursor = start + shared.len();
+                            } else {
+                                leave_block(prompt, line, width, row);
+                                show_candidates(options);
+                                row = 0;
+                            }
+                            row = redraw(prompt, line, cursor, width, row);
+                        }
+                    },
+                    Key.Backspace => {
+                        if (cursor > 0) {
+                            line = line.substring(
+                                0,
+                                cursor - 1
+                            ) + line.substring(cursor, line.len());
+                            cursor = cursor - 1;
+                            row = redraw(prompt, line, cursor, width, row);
+                        }
+                    },
+                    Key.Delete => {
+                        if (cursor < line.len()) {
+                            line = line.substring(
+                                0,
+                                cursor
+                            ) + line.substring(cursor + 1, line.len());
+                            row = redraw(prompt, line, cursor, width, row);
+                        }
+                    },
+                    Key.Left => {
+                        if (cursor > 0) {
+                            cursor = cursor - 1;
+                            row = redraw(prompt, line, cursor, width, row);
+                        }
+                    },
+                    Key.Right => {
+                        if (cursor < line.len()) {
+                            cursor = cursor + 1;
+                            row = redraw(prompt, line, cursor, width, row);
+                        }
+                    },
+                    Key.Home => {
+                        cursor = 0;
+                        row = redraw(prompt, line, cursor, width, row);
+                    },
+                    Key.End => {
+                        cursor = line.len();
+                        row = redraw(prompt, line, cursor, width, row);
+                    },
+                    Key.Up => {
+                        if (index > 0) {
+                            if (index == e.history.len()) {
+                                stash = line;
+                            }
+                            index = index - 1;
+                            line = e.history[index];
+                            cursor = line.len();
+                            row = redraw(prompt, line, cursor, width, row);
+                        }
+                    },
+                    Key.Down => {
+                        if (index < e.history.len()) {
+                            index = index + 1;
+                            line = if (index == e.history.len()) { stash } else { e.history[index] };
+                            cursor = line.len();
+                            row = redraw(prompt, line, cursor, width, row);
+                        }
+                    },
+                    Key.Char(c) => {
+                        let text = to_string(c);
+                        line = line.substring(
+                            0,
+                            cursor
+                        ) + text + line.substring(cursor, line.len());
+                        cursor = cursor + text.len();
+                        row = redraw(prompt, line, cursor, width, row);
+                    },
+                    _ => { },
+                }
+            },
+        }
+    }
+    Option.None
+}
+
+// El principio de la palabra anterior al cursor (lo que borra Ctrl-W).
+fn word_boundary(line: string, cursor: int) -> int {
+    var i = cursor;
+    while (i > 0 && line.substring(i - 1, i) == " ") {
+        i = i - 1;
+    }
+    while (i > 0 && line.substring(i - 1, i) != " ") {
+        i = i - 1;
+    }
+    i
+}
+
+// Lo que un control imprime antes de repintar (y la fila desde la que se repinta).
+fn control(e: Editor, c: char, prompt: string, width: int, row: int) -> int {
+    if (c == 'c') {
+        // Ctrl-C: se abandona la línea, no la sesión.
+        emit(ui.dim("^C"));
+        emit("\r\n");
+        return 0;
+    }
+    if (c == 'l') {
+        emit(ui.clear_screen());
+        return 0;
+    }
+    row
+}

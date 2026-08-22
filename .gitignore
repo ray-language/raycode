@@ -1,0 +1,10 @@
+# Build output: the native binary is produced by `ray build --native` and shipped
+# through the GitHub Release, never committed.
+/bin/raycode
+/dist/
+
+# Dependencies fetched by `ray fetch`.
+/.ray-deps/
+
+# macOS
+.DS_Store

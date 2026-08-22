@@ -1,0 +1,352 @@
+// raycode — un harness de terminal para modelos locales (llama.cpp) o remotos con
+// protocolo OpenAI o Anthropic. Un turno del usuario dispara un bucle de herramientas
+// hasta que el modelo contesta; cada petición se cronometra y se contabiliza.
+//
+//   ray run                                   chat con llama.cpp en 127.0.0.1:8080
+//   ray run main.ray -p anthropic             chat con la API de Anthropic
+//   ray run main.ray -p openai -m gpt-4o-mini chat con OpenAI
+//   ray run main.ray --allow-exec "resume el repo"   una sola petición, con shell
+//
+// Variables de entorno: RAYCODE_PROFILE, RAYCODE_BASE_URL, RAYCODE_MODEL, RAYCODE_API_KEY,
+// ANTHROPIC_API_KEY, OPENAI_API_KEY, RAYCODE_SYSTEM, RAYCODE_MAX_TOKENS, RAYCODE_TEMPERATURE,
+// RAYCODE_MAX_STEPS, RAYCODE_TIMEOUT_MS, NO_COLOR.
+from src/config import Config;
+import src/config;
+import src/agent;
+import src/client;
+import src/usage;
+import src/lineedit;
+import src/ui;
+
+// La cabecera: qué modelo, contra qué endpoint, con qué herramientas. Lo que el endpoint
+// declare sobre el modelo cargado se muestra junto a lo configurado.
+fn banner(s: agent.Session) {
+    let c = s.config;
+    print("");
+    print(
+        ui.bold(ui.magenta("raycode")) + ui.dim(" · a raylang harness for local and remote models")
+    );
+    print(ui.rule(64));
+    print(ui.dim("profile  ") + c.profile + ui.dim(" (${config.api_name(c.api)})"));
+    print(ui.dim("endpoint ") + config.chat_url(c));
+    print(ui.dim("model    ") + ui.bold(c.model));
+    match (client.probe(c)) {
+        Option.Some(i) => {
+            let context = if (i.context > 0) { " · ctx ${ui.fmt_count(i.context)}" } else { "" };
+            let detail = if (i.detail.trim() == "") { "" } else { " · ${i.detail}" };
+            print(ui.dim("served   ") + i.name + ui.dim(context + detail));
+        },
+        Option.None => {
+            print(ui.dim("served   (the endpoint did not report model details)"));
+        },
+    }
+    let flow = if (c.stream) { "streaming" } else { "no streaming" };
+    print(
+        ui.dim("sampling ") + "max_tokens ${c.max_tokens} · temperature ${ui.fmt_float(c.temperature, 2)} · max_steps ${c.max_steps} · ${flow}"
+    );
+    if (ui.workspace() != ".") {
+        print(ui.dim("workspace ") + ui.workspace());
+    }
+    var names: [string] = [];
+    for t in s.tools {
+        names.push(t.name);
+    }
+    print(ui.dim("tools    ") + names.join(", "));
+    if (!c.allow_exec) {
+        print(ui.dim("         run_command is off; start with --allow-exec to enable the shell"));
+    }
+    print(ui.rule(64));
+    print(ui.dim("/help for commands · Ctrl-D to quit"));
+    print("");
+}
+
+// Lo que Tab completa en primera posición.
+fn commands() -> [string] {
+    [
+        "/help",
+        "/usage",
+        "/model",
+        "/set",
+        "/tools",
+        "/system",
+        "/reset",
+        "/verbose",
+        "/exit",
+        "/quit"
+    ]
+}
+
+fn help() {
+    print(ui.bold("commands"));
+    print("  /help              this list");
+    print("  /usage             tokens, requests and latency for the session");
+    print("  /model [<id>]      the current model and the endpoint's catalogue; switch with an id");
+    print("  /set [k v]         knobs: max-tokens, temperature, max-steps, timeout-ms, stream");
+    print("  /tools             the tools exposed to the model");
+    print("  /system <text>     replace the system prompt (empty: show it)");
+    print("  /reset             forget the transcript, keep the session totals");
+    print("  /verbose           toggle request/response tracing on stderr");
+    print("  /exit              leave (same as Ctrl-D)");
+    print(ui.dim("  esc stops the turn in progress (the model or the tool it is running)"));
+    print(ui.dim("  Tab completes commands and paths · ↑/↓ history · Ctrl-A/E/U/K/W edit"));
+}
+
+fn show_usage(s: agent.Session) {
+    let t = s.total;
+    let mark = if (usage.is_estimate(t)) { "≈" } else { "" };
+    print(ui.bold("usage") + ui.dim(" · ${s.turns} turn(s), ${s.steps} request(s)"));
+    print(
+        "  input   ${mark}${ui.fmt_count(t.input_tokens)} tokens" + if (t.cached_tokens > 0) { " (${ui.fmt_count(t.cached_tokens)} from cache)" } else { "" }
+    );
+    print("  output  ${mark}${ui.fmt_count(t.output_tokens)} tokens");
+    print("  total   ${mark}${ui.fmt_count(usage.total_tokens(t))} tokens");
+    print(
+        "  time    ${ui.fmt_millis(t.latency_ms)} in the model · ${ui.fmt_float(usage.output_speed(t), 1)} output tok/s"
+    );
+    print(ui.dim("  counts  ${counts_source(t)}"));
+}
+
+// De dónde salen las cifras. Un endpoint que no informa de tokens no es lo mismo que un
+// endpoint que informa de cero, y el panel no debe confundirlos.
+fn counts_source(t: usage.Usage) -> string {
+    if (t.requests == 0) {
+        "nothing sent yet"
+    } else if (t.measured == t.requests) {
+        "reported by the endpoint"
+    } else if (t.measured == 0) {
+        "estimated locally — this endpoint reports no token counts"
+    } else {
+        "${t.measured} of ${t.requests} requests reported by the endpoint, the rest estimated"
+    }
+}
+
+// El modelo en uso y, si el endpoint publica catálogo, todo lo que ofrece.
+fn show_model(s: agent.Session) {
+    print(ui.bold("model") + ui.dim(" · ${config.api_name(s.config.api)} · ${s.config.base_url}"));
+    match (client.probe(s.config)) {
+        Option.Some(i) => {
+            let context = if (i.context > 0) { " · ctx ${ui.fmt_count(i.context)}" } else { "" };
+            let detail = if (i.detail.trim() == "") { "" } else { " · ${i.detail}" };
+            print("  " + ui.bold(s.config.model) + ui.dim("${context}${detail}"));
+        },
+        Option.None => {
+            print(
+                "  " + ui.bold(s.config.model) + ui.dim(" (the endpoint reports no details for it)")
+            );
+        },
+    }
+    let catalogue = client.list_models(s.config);
+    if (catalogue.len() == 0) {
+        print(ui.dim("  this endpoint publishes no model catalogue"));
+        return;
+    }
+    print(ui.dim("  available (/model <id> to switch)"));
+    for id in catalogue {
+        if (id == s.config.model) {
+            print("  " + ui.green("● ") + ui.bold(id));
+        } else {
+            print("  " + ui.dim("○ ") + id);
+        }
+    }
+}
+
+// Cambia de modelo en caliente. La conversación se conserva: cambiar de modelo a mitad
+// de un hilo es legítimo (y a veces la razón de cambiar).
+fn switch_model(s: agent.Session, id: string) {
+    let catalogue = client.list_models(s.config);
+    if (catalogue.len() > 0 && !catalogue.contains(id)) {
+        print(ui.yellow("! ") + "the endpoint does not list '${id}'; using it anyway");
+    }
+    s.config.model = id;
+    print(ui.dim("model is now ") + ui.bold(id));
+}
+
+// Los mandos de muestreo, en caliente. Sin argumentos, los enseña.
+fn show_settings(s: agent.Session) {
+    let c = s.config;
+    print(ui.bold("settings") + ui.dim(" · /set <clave> <valor>"));
+    print("  max-tokens   ${c.max_tokens}");
+    print("  temperature  ${ui.fmt_float(c.temperature, 2)}");
+    print("  max-steps    ${c.max_steps}");
+    print("  timeout-ms   ${c.timeout_ms}");
+    print("  stream       ${if (c.stream) { "on" } else { "off" }}");
+}
+
+fn apply_setting(s: agent.Session, key: string, value: string) {
+    if (key == "max-tokens") {
+        match (parse_int(value)) {
+            Option.Some(n) => {
+                s.config.max_tokens = n;
+                print(ui.dim("max-tokens is now ") + to_string(n));
+            },
+            Option.None => print(ui.red("! ") + "'${value}' is not a whole number"),
+        }
+    } else if (key == "temperature") {
+        match (parse_float(value)) {
+            Option.Some(t) => {
+                s.config.temperature = t;
+                print(ui.dim("temperature is now ") + ui.fmt_float(t, 2));
+            },
+            Option.None => print(ui.red("! ") + "'${value}' is not a number"),
+        }
+    } else if (key == "max-steps") {
+        match (parse_int(value)) {
+            Option.Some(n) => {
+                s.config.max_steps = n;
+                print(ui.dim("max-steps is now ") + to_string(n));
+            },
+            Option.None => print(ui.red("! ") + "'${value}' is not a whole number"),
+        }
+    } else if (key == "timeout-ms") {
+        match (parse_int(value)) {
+            Option.Some(n) => {
+                s.config.timeout_ms = n;
+                print(ui.dim("timeout-ms is now ") + to_string(n));
+            },
+            Option.None => print(ui.red("! ") + "'${value}' is not a whole number"),
+        }
+    } else {
+        print(
+            ui.red("! ") + "unknown setting '${key}' (max-tokens, temperature, max-steps, timeout-ms)"
+        );
+    }
+}
+
+fn show_tools(s: agent.Session) {
+    print(ui.bold("tools"));
+    for t in s.tools {
+        print("  " + ui.bold(t.name));
+        print(ui.dim(ui.indent(t.description, "    ")));
+    }
+}
+
+// Un comando de barra. Devuelve false cuando el comando es "salir".
+fn command(s: agent.Session, line: string) -> bool {
+    let parts = line.split(" ");
+    let name = parts[0];
+    let rest = line.substring(name.len(), line.len()).trim();
+    if (name == "/help") {
+        help();
+    } else if (name == "/usage") {
+        show_usage(s);
+    } else if (name == "/set") {
+        let parts = rest.split(" ");
+        if (rest == "") {
+            show_settings(s);
+        } else if (parts.len() < 2) {
+            print(ui.red("! ") + "usage: /set <clave> <valor>");
+        } else {
+            apply_setting(s, parts[0], parts[1]);
+        }
+    } else if (name == "/tools") {
+        show_tools(s);
+    } else if (name == "/model") {
+        if (rest == "") {
+            show_model(s);
+        } else {
+            switch_model(s, rest);
+        }
+    } else if (name == "/system") {
+        if (rest == "") {
+            print(ui.dim(s.config.system));
+        } else {
+            s.config.system = rest;
+            agent.reset(s);
+            print(ui.dim("system prompt replaced; transcript cleared"));
+        }
+    } else if (name == "/reset") {
+        agent.reset(s);
+        print(ui.dim("transcript cleared"));
+    } else if (name == "/verbose") {
+        s.config.verbose = !s.config.verbose;
+        print(ui.dim("verbose ${s.config.verbose}"));
+    } else if (name == "/exit" || name == "/quit") {
+        return false;
+    } else {
+        print(ui.red("unknown command ") + name + ui.dim(" (/help)"));
+    }
+    true
+}
+
+// Un turno completo, con su línea de uso al pie. Los errores de red no matan la sesión.
+fn turn(s: agent.Session, prompt: string) {
+    match (agent.ask(s, prompt)) {
+        // Un turno parado antes de la primera respuesta no tiene nada que contar.
+        Result.Ok(u) => if (u.requests > 0) {
+            print(ui.usage_line(u));
+        },
+        Result.Err(e) => print(ui.red("✗ ") + e),
+    }
+    print("");
+}
+
+fn repl(s: agent.Session, editor: lineedit.Editor) -> int {
+    banner(s);
+    while (true) {
+        match (lineedit.read_line(editor, "› ", commands())) {
+            Option.None => {
+                print("");
+                show_usage(s);
+                return 0;
+            },
+            Option.Some(line) => {
+                let text = line.trim();
+                if (text != "") {
+                    if (text.starts_with("/")) {
+                        if (!command(s, text)) {
+                            show_usage(s);
+                            return 0;
+                        }
+                    } else {
+                        turn(s, text);
+                    }
+                }
+            },
+        }
+    }
+    0
+}
+
+fn main() -> int {
+    match (config.load(
+    args()
+)) {
+        Result.Err(e) => {
+            eprint(ui.red("raycode: ") + e);
+            eprint(
+                "usage: ray run main.ray [-p llama|openai|anthropic] [-m model] [-u base-url] [-k key] [--allow-exec] [prompt…]"
+            );
+            2
+        },
+        Result.Ok(c) => {
+            let s = agent.open(c);
+            // Con una petición en la línea de órdenes el harness es de un solo turno.
+            if (c.prompt.trim() != "") {
+                match (agent.ask(s, c.prompt)) {
+                    Result.Ok(u) => {
+                        print(ui.usage_line(u));
+                        0
+                    },
+                    Result.Err(e) => {
+                        eprint(ui.red("✗ ") + e);
+                        1
+                    },
+                }
+            } else {
+                let editor = lineedit.open(lineedit.default_history_path());
+                // El modo crudo lo restaura `std/term` pase lo que pase (también al salir
+                // el proceso), así que aquí solo queda no perder el código de salida.
+                let guarded = try_call(fn() -> int {
+                    repl(s, editor)
+                });
+                match (guarded) {
+                    Result.Ok(code) => code,
+                    Result.Err(e) => {
+                        eprint(ui.red("raycode: ") + e);
+                        70
+                    },
+                }
+            }
+        },
+    }
+}

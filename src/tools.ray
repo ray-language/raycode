@@ -1,0 +1,304 @@
+// El catálogo de herramientas que el harness expone al modelo. Cada una declara su
+// esquema JSON (lo que viaja al proveedor) y su implementación, que recibe los
+// argumentos ya parseados y devuelve texto para el turno `tool`.
+import std/json;
+import std/fs;
+import std/process;
+import std/math;
+import std/time;
+import src/ui;
+from std/json import Json;
+
+/// One tool as the model sees it: name, description and the JSON Schema of its arguments.
+///
+/// It is DATA, not behaviour: la implementación se despacha por nombre en `execute`. El
+/// motivo es que la sesión entera cruza a la fibra que atiende cada paso, y un valor con
+/// funciones dentro no puede cruzar una frontera de fibra en el binario nativo.
+pub struct Tool {
+    name: string,
+    description: string,
+    schema: Json,
+}
+
+// Un esquema escrito como literal JSON. Es un error de programación si no parsea.
+fn schema_of(source: string) -> Json {
+    match (json.parse(source)) {
+        Result.Ok(j) => j,
+        Result.Err(e) => panic("bad tool schema: ${e}"),
+    }
+}
+
+// El argumento `name` como texto, o un Err explicativo (los modelos pequeños olvidan campos).
+fn need_string(a: Json, name: string) -> Result<string, string> {
+    match (json.get_string(a, name)) {
+        Option.Some(s) => Result.Ok(s),
+        Option.None => Result.Err("missing required string argument '${name}'"),
+    }
+}
+
+fn int_or(a: Json, name: string, fallback: int) -> int {
+    match (json.get_int(a, name)) {
+        Option.Some(n) => n,
+        Option.None => fallback,
+    }
+}
+
+const MAX_OUTPUT: int = 12000;
+
+// Tope de lectura de un archivo. Un volcado de 2 GB no puede tumbar la sesión por el mero
+// hecho de que el modelo lo nombre; para mirar código, 1 MiB sobra de largo.
+const MAX_READ: int = 1048576;
+
+const READ_CHUNK: int = 65536;
+
+// Tope de captura de un mandato: se drena todo, pero solo se guarda hasta aquí.
+const MAX_CAPTURE: int = 262144;
+
+// Recorta la salida de una herramienta: el contexto es caro y los modelos locales, cortos.
+fn cap(s: string) -> string {
+    if (s.len() <= MAX_OUTPUT) {
+        s
+    } else {
+        s.substring(0, MAX_OUTPUT) + "\n… [truncated, ${s.len() - MAX_OUTPUT} more characters]"
+    }
+}
+
+// Lee el archivo por trozos y para en el tope, en vez de traerlo entero a memoria
+// (`fs.read_bytes` sobre el handle: la memoria queda acotada por un trozo).
+fn read_capped(path: string) -> Result<string, string> {
+    let handle = fs.open(path, "r")?;
+    var data = b"";
+    var reading = true;
+    while (reading && data.len() < MAX_READ) {
+        match (fs.read_bytes(handle, READ_CHUNK)) {
+            Result.Ok(chunk) => match (chunk) {
+                Option.Some(piece) => {
+                    data = data + piece;
+                },
+                Option.None => {
+                    reading = false;
+                },
+            },
+            Result.Err(e) => {
+                close(handle);
+                return Result.Err(e);
+            },
+        }
+    }
+    close(handle);
+    // El corte cae en un octeto cualquiera y puede partir un carácter: se recortan los
+    // pocos octetos de cola que hagan falta hasta que el texto vuelva a ser UTF-8 válido.
+    var cut = data.len();
+    var attempts = 0;
+    while (attempts < 4) {
+        match (from_utf8(data.sub_bytes(0, cut))) {
+            Result.Ok(text) => {
+                return Result.Ok(text);
+            },
+            Result.Err(_) => {
+                cut = cut - 1;
+                attempts = attempts + 1;
+            },
+        }
+    }
+    Result.Err("the file is not valid UTF-8 text")
+}
+
+fn tool_read_file(a: Json) -> Result<string, string> {
+    let asked = need_string(a, "path")?;
+    let path = ui.resolve_path(asked);
+    let content = read_capped(path)?;
+    let lines = content.split("\n");
+    let start = math.max(1, int_or(a, "start_line", 1));
+    let count = math.max(1, int_or(a, "max_lines", 400));
+    var out: [string] = [];
+    var i = start - 1;
+    while (i < lines.len() && out.len() < count) {
+        out.push("${i + 1}: ${lines[i]}");
+        i = i + 1;
+    }
+    // Si el archivo pasaba del tope, decirlo: el modelo tiene que saber que lo que ve no
+    // es todo, o razonará sobre un archivo que no existe.
+    let note = match (fs.file_size(path)) {
+        Result.Ok(size) => if (size > MAX_READ) {
+            "\n… [only the first ${MAX_READ} bytes of ${size} were read]"
+        } else {
+            ""
+        },
+        Result.Err(_) => "",
+    };
+    if (out.len() == 0) {
+        Result.Ok("(empty selection: ${asked} has ${lines.len()} lines)")
+    } else {
+        Result.Ok(cap(out.join("\n")) + note)
+    }
+}
+
+fn tool_write_file(a: Json) -> Result<string, string> {
+    let asked = need_string(a, "path")?;
+    let content = need_string(a, "content")?;
+    let written = fs.write_file(ui.resolve_path(asked), content)?;
+    Result.Ok("wrote ${written} bytes to ${asked}")
+}
+
+fn tool_list_dir(a: Json) -> Result<string, string> {
+    let asked = match (json.get_string(a, "path")) {
+        Option.Some(p) => p,
+        Option.None => ".",
+    };
+    let path = ui.resolve_path(asked);
+    let entries = fs.list_dir(path)?;
+    var out: [string] = [];
+    for e in entries {
+        let full = if (path.ends_with("/")) { path + e } else { path + "/" + e };
+        if (fs.is_dir(full)) {
+            out.push(e + "/");
+        } else {
+            match (fs.file_size(full)) {
+                Result.Ok(n) => out.push("${e} (${n} B)"),
+                Result.Err(_) => out.push(e),
+            }
+        }
+    }
+    if (out.len() == 0) {
+        Result.Ok("(empty directory: ${asked})")
+    } else {
+        Result.Ok(cap(out.sort().join("\n")))
+    }
+}
+
+// El estado de salida como texto. Va aparte porque el transpilador nativo no sabe tipar
+// este `match` cuando comparte función con el `match (recv(…))` del drenado: lo deja como
+// un stub que reventaría al llamarlo.
+fn exit_label(code: process.Exit) -> string {
+    match (code) {
+        process.Exit.Code(c) => "exit ${c}",
+        process.Exit.Signal(s) => "killed by signal ${s}",
+    }
+}
+
+fn tool_run_command(a: Json) -> Result<string, string> {
+    let command = need_string(a, "command")?;
+    let timeout = int_or(a, "timeout_ms", 30000);
+    // Se lanza en STREAMING, no con `run()`: drenar el canal aparca la fibra y deja correr
+    // al indicador de actividad, mientras que `run()` bloquearía el planificador entero.
+    let p = process.cmd("sh", ["-c", command]).dir(ui.workspace()).merge_output().stream()?;
+    let started = time.monotonic();
+    // El streaming no admite `timeout_ms`, así que el plazo se compone a mano: una fibra
+    // que espera y mata al grupo de proceso (matar tras `wait` no hace nada).
+    spawn(fn() {
+        time.sleep(timeout);
+        p.kill(true);
+    });
+    var captured = b"";
+    var draining = true;
+    while (draining) {
+        match (recv(p.out)) {
+            Option.Some(chunk) => {
+                // Se sigue drenando aunque ya no se guarde: cortar el canal frenaría al hijo.
+                if (captured.len() < MAX_CAPTURE) {
+                    captured = captured + chunk;
+                }
+            },
+            Option.None => {
+                draining = false;
+            },
+        }
+    }
+    let elapsed = time.monotonic() - started;
+    let status = exit_label(p.wait());
+    let note = if (elapsed >= timeout) { " (timed out after ${timeout}ms)" } else { "" };
+    let text = from_utf8(captured)?;
+    Result.Ok(cap("[${status}${note}]\n" + text))
+}
+
+/// The tools offered to the model. `run_command` is only present when the harness was
+/// started with `--allow-exec`: shell access is opt-in.
+pub fn registry(allow_exec: bool) -> [Tool] {
+    var tools: [Tool] = [
+        Tool {
+            name: "read_file",
+            description: "Read a UTF-8 text file from the workspace, numbered by line. Use start_line/max_lines to page through big files.",
+            schema: schema_of(
+                `{"type":"object","properties":{"path":{"type":"string","description":"Path to the file, relative to the working directory"},"start_line":{"type":"integer","description":"First line to show (1-based, default 1)"},"max_lines":{"type":"integer","description":"How many lines to show (default 400)"}},"required":["path"]}`
+            )
+        },
+        Tool {
+            name: "write_file",
+            description: "Create or overwrite a text file with the given content. The parent directory must exist.",
+            schema: schema_of(
+                `{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to write"},"content":{"type":"string","description":"Full new content of the file"}},"required":["path","content"]}`
+            )
+        },
+        Tool {
+            name: "list_dir",
+            description: "List the entries of a directory; directories end with '/' and files show their size.",
+            schema: schema_of(
+                `{"type":"object","properties":{"path":{"type":"string","description":"Directory to list (default '.')"}},"required":[]}`
+            )
+        }
+    ];
+    if (allow_exec) {
+        tools.push(
+            Tool {
+                name: "run_command",
+                description: "Run a shell command in the working directory and return its merged output and exit status.",
+                schema: schema_of(
+                    `{"type":"object","properties":{"command":{"type":"string","description":"The shell command line to run"},"timeout_ms":{"type":"integer","description":"Kill the command after this many milliseconds (default 30000)"}},"required":["command"]}`
+                )
+            }
+        );
+    }
+    tools
+}
+
+/// True when the registry offers a tool by that name.
+pub fn offers(tools: [Tool], name: string) -> bool {
+    for t in tools {
+        if (t.name == name) {
+            return true;
+        }
+    }
+    false
+}
+
+// El despacho por nombre. Aquí es donde el nombre que manda el modelo se convierte en
+// trabajo; `offers` decide antes si ese nombre está permitido en esta sesión.
+fn dispatch(name: string, arguments: Json) -> Result<string, string> {
+    if (name == "read_file") {
+        tool_read_file(arguments)
+    } else if (name == "write_file") {
+        tool_write_file(arguments)
+    } else if (name == "list_dir") {
+        tool_list_dir(arguments)
+    } else if (name == "run_command") {
+        tool_run_command(arguments)
+    } else {
+        Result.Err("unknown tool '${name}'")
+    }
+}
+
+/// Runs `name` with the raw JSON `arguments` the model produced. Every failure — unknown
+/// tool, malformed arguments, tool error, panic — comes back as text for the model to
+/// read and correct, never as a crash of the session.
+pub fn execute(tools: [Tool], name: string, arguments: string) -> string {
+    if (!offers(tools, name)) {
+        return "error: unknown tool '${name}'";
+    }
+    let raw = if (arguments.trim() == "") { "{}" } else { arguments };
+    match (json.parse(raw)) {
+        Result.Err(e) => "error: arguments are not valid JSON (${e})",
+        Result.Ok(a) => {
+            let guarded = try_call(fn() -> Result<string, string> {
+                dispatch(name, a)
+            });
+            match (guarded) {
+                Result.Err(e) => "error: tool panicked (${e})",
+                Result.Ok(r) => match (r) {
+                    Result.Ok(text) => text,
+                    Result.Err(e) => "error: ${e}",
+                },
+            }
+        },
+    }
+}

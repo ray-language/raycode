@@ -1,0 +1,235 @@
+// Presentación en terminal: color ANSI (desactivable con NO_COLOR) y los formateadores
+// que usan el banner, el panel de uso y la traza de herramientas.
+import std/math;
+import std/io;
+import std/term;
+from src/usage import Usage;
+import src/usage;
+
+const DEFAULT_WIDTH: int = 80;
+
+const MIN_WIDTH: int = 20;
+
+// El escape ANSI no cabe en un literal (no hay \u): se construye por code point.
+fn esc() -> string {
+    match (char_from_code(27)) {
+        Option.Some(c) => to_string(c),
+        Option.None => "",
+    }
+}
+
+/// True unless the environment asks for plain output (`NO_COLOR` or `RAYCODE_NO_COLOR`).
+pub fn color_enabled() -> bool {
+    match (env("NO_COLOR")) {
+        Option.Some(_) => false,
+        Option.None => match (env("RAYCODE_NO_COLOR")) {
+            Option.Some(_) => false,
+            Option.None => true,
+        },
+    }
+}
+
+/// Wraps `s` in an SGR code, or returns it untouched when color is disabled.
+pub fn paint(code: string, s: string) -> string {
+    if (color_enabled()) { "${esc()}[${code}m${s}${esc()}[0m" } else { s }
+}
+
+pub fn bold(s: string) -> string { paint("1", s) }
+
+pub fn dim(s: string) -> string { paint("2", s) }
+
+pub fn red(s: string) -> string { paint("31", s) }
+
+pub fn green(s: string) -> string { paint("32", s) }
+
+pub fn yellow(s: string) -> string { paint("33", s) }
+
+pub fn blue(s: string) -> string { paint("34", s) }
+
+pub fn magenta(s: string) -> string { paint("35", s) }
+
+pub fn cyan(s: string) -> string { paint("36", s) }
+
+pub fn italic(s: string) -> string { paint("3", s) }
+
+pub fn underline(s: string) -> string { paint("4", s) }
+
+pub fn inverse(s: string) -> string { paint("7", s) }
+
+/// A horizontal rule of `width` box-drawing characters.
+pub fn rule(width: int) -> string {
+    dim("─".repeat(width))
+}
+
+/// `x` with exactly `decimals` decimal places (half away from zero).
+pub fn fmt_float(x: float, decimals: int) -> string {
+    var unit = 1;
+    var i = 0;
+    while (i < decimals) {
+        unit = unit * 10;
+        i = i + 1;
+    }
+    let scaled = math.round(x * unit as float) as int;
+    let sign = if (scaled < 0) { "-" } else { "" };
+    let magnitude = if (scaled < 0) { 0 - scaled } else { scaled };
+    let whole = magnitude / unit;
+    var frac = to_string(magnitude - whole * unit);
+    while (frac.len() < decimals) {
+        frac = "0" + frac;
+    }
+    if (decimals <= 0) { "${sign}${whole}" } else { "${sign}${whole}.${frac}" }
+}
+
+/// A duration in milliseconds as a compact, human-readable string.
+pub fn fmt_millis(ms: int) -> string {
+    if (ms < 1000) {
+        "${ms}ms"
+    } else if (ms < 60000) {
+        fmt_float(ms as float / 1000.0, 1) + "s"
+    } else {
+        let minutes = ms / 60000;
+        let seconds = (ms - minutes * 60000) / 1000;
+        "${minutes}m ${seconds}s"
+    }
+}
+
+/// A token count with thousands separators (12345 -> "12,345").
+pub fn fmt_count(n: int) -> string {
+    let sign = if (n < 0) { "-" } else { "" };
+    var rest = if (n < 0) { 0 - n } else { n };
+    var out = "";
+    while (rest >= 1000) {
+        var group = to_string(rest - rest / 1000 * 1000);
+        while (group.len() < 3) {
+            group = "0" + group;
+        }
+        out = "," + group + out;
+        rest = rest / 1000;
+    }
+    "${sign}${rest}${out}"
+}
+
+/// `s` clipped to `max` characters, with an ellipsis when it was cut.
+pub fn clip(s: string, max: int) -> string {
+    if (s.len() <= max) { s } else { s.substring(0, max) + "…" }
+}
+
+/// `s` with every line prefixed by `prefix` (used to indent tool output).
+pub fn indent(s: string, prefix: string) -> string {
+    let lines = s.split("\n");
+    var out: [string] = [];
+    for line in lines {
+        out.push(prefix + line);
+    }
+    out.join("\n")
+}
+
+/// The escape that erases the current line (used by the line editor on every redraw).
+pub fn erase_line() -> string {
+    "${esc()}[2K"
+}
+
+/// The escape that moves the cursor `n` columns right from the left margin.
+pub fn cursor_right(n: int) -> string {
+    "${esc()}[${n}C"
+}
+
+/// The escape that erases from the cursor to the end of the screen: what a redraw needs
+/// when the edited line wraps over several rows.
+pub fn erase_below() -> string {
+    "${esc()}[0J"
+}
+
+/// The escape that moves the cursor `n` rows up.
+pub fn cursor_up(n: int) -> string {
+    "${esc()}[${n}A"
+}
+
+/// The escape that moves the cursor `n` rows down.
+pub fn cursor_down(n: int) -> string {
+    "${esc()}[${n}B"
+}
+
+/// The escape that clears the screen and homes the cursor (Ctrl-L).
+pub fn clear_screen() -> string {
+    "${esc()}[2J${esc()}[H"
+}
+
+/// Writes `s` to the console with no trailing newline, flushed at once. Everything the
+/// harness paints in place — the prompt, the redraw, the activity indicator — goes here.
+pub fn write_inline(s: string) {
+    match (io.write(s)) {
+        Result.Ok(_) => {
+            match (io.flush()) {
+                Result.Ok(_) => { },
+                Result.Err(_) => { },
+            }
+        },
+        Result.Err(_) => { },
+    }
+}
+
+/// The directory the agent works on: the process's own, or the one the launcher passed in
+/// `RAYCODE_WORKSPACE` when raycode was started from outside its own project.
+pub fn workspace() -> string {
+    match (env("RAYCODE_WORKSPACE")) {
+        Option.Some(dir) => if (dir.trim() == "") { "." } else { dir },
+        Option.None => ".",
+    }
+}
+
+/// A path as the user (or the model) wrote it, resolved against the workspace. Absolute
+/// paths are left alone.
+pub fn resolve_path(path: string) -> string {
+    let root = workspace();
+    if (root == "." || path.starts_with("/")) {
+        // Sin espacio de trabajo aparte, la ruta ya está donde tiene que estar.
+        return path;
+    }
+    if (path == "." || path == "./") {
+        return root;
+    }
+    if (path.starts_with("./")) {
+        return root + "/" + path.substring(2, path.len());
+    }
+    root + "/" + path
+}
+
+/// True when the console is a terminal on both ends: what everything interactive needs.
+pub fn interactive() -> bool {
+    term.is_tty(0) && term.is_tty(1)
+}
+
+/// The terminal width in columns, or 80 when there is no terminal to ask.
+pub fn width() -> int {
+    match (term.size()) {
+        Option.Some(size) => if (size.0 >= MIN_WIDTH) { size.0 } else { DEFAULT_WIDTH },
+        Option.None => DEFAULT_WIDTH,
+    }
+}
+
+/// The terminal height in rows, or 24 when there is no terminal to ask.
+pub fn height() -> int {
+    match (term.size()) {
+        Option.Some(size) => if (size.1 > 0) { size.1 } else { 24 },
+        Option.None => 24,
+    }
+}
+
+/// `text` as a line for a terminal in RAW mode: every newline gets its carriage return
+/// back, including the ones inside the text, plus one at the end. In raw mode the
+/// terminal translates nothing, so a block written without this comes out as a staircase.
+pub fn crlf(text: string) -> string {
+    text.replace("\n", "\r\n") + "\r\n"
+}
+
+/// One-line usage summary: tokens in/out, cache reads, requests and speed.
+pub fn usage_line(u: Usage) -> string {
+    let speed = usage.output_speed(u);
+    let cached = if (u.cached_tokens > 0) { " · cache ${fmt_count(u.cached_tokens)}" } else { "" };
+    // `≈` avisa de que las cifras las contó el harness, no el proveedor.
+    let mark = if (usage.is_estimate(u)) { "≈" } else { "" };
+    dim(
+        "↑ ${mark}${fmt_count(u.input_tokens)} in  ↓ ${mark}${fmt_count(u.output_tokens)} out${cached}" + " · ${u.requests} req · ${fmt_millis(u.latency_ms)} · ${fmt_float(speed, 1)} tok/s"
+    )
+}

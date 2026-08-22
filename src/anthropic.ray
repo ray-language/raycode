@@ -1,0 +1,420 @@
+// Adaptador del protocolo Anthropic (`POST /v1/messages`): el contenido va en bloques
+// (`text`, `tool_use`, `tool_result`) y los resultados de herramientas se agrupan en un
+// único turno `user`. Los bloques del asistente se reenvían verbatim (campo `raw`) para
+// no romper los bloques de razonamiento firmados.
+import std/json;
+from std/json import Json;
+from src/config import Config;
+from src/message import Message, ToolCall, Reply;
+import src/message;
+from src/tools import Tool;
+from src/usage import Usage;
+
+const VERSION: string = "2023-06-01";
+
+fn jstr(s: string) -> Json {
+    Json.JStr(s)
+}
+
+fn jint(n: int) -> Json {
+    Json.JNum(n as float)
+}
+
+fn obj(keys: [string], values: [Json]) -> Json {
+    var m: Map<string, Json> = Map.new();
+    var i = 0;
+    while (i < keys.len() && i < values.len()) {
+        m.insert(keys[i], values[i]);
+        i = i + 1;
+    }
+    Json.JObject(m)
+}
+
+// El JSON de los argumentos de una llamada; un objeto vacío si el modelo mandó basura.
+fn arguments_json(raw: string) -> Json {
+    let text = if (raw.trim() == "") { "{}" } else { raw };
+    match (json.parse(text)) {
+        Result.Ok(j) => j,
+        Result.Err(_) => Json.JObject(Map.new()),
+    }
+}
+
+fn tool_json(t: Tool) -> Json {
+    obj(["name", "description", "input_schema"], [jstr(t.name), jstr(t.description), t.schema])
+}
+
+// Los bloques de un turno del asistente: los originales si los conservamos, o una
+// reconstrucción a partir del texto y las llamadas.
+fn assistant_blocks(m: Message) -> [Json] {
+    if (m.raw.trim() != "") {
+        match (json.parse(m.raw)) {
+            Result.Ok(j) => match (json.as_array(j)) {
+                Option.Some(blocks) => {
+                    return blocks;
+                },
+                Option.None => { },
+            },
+            Result.Err(_) => { },
+        }
+    }
+    var blocks: [Json] = [];
+    if (m.text.trim() != "") {
+        blocks.push(obj(["type", "text"], [jstr("text"), jstr(m.text)]));
+    }
+    for c in m.tool_calls {
+        blocks.push(
+            obj(
+                ["type", "id", "name", "input"],
+                [jstr("tool_use"), jstr(c.id), jstr(c.name), arguments_json(c.arguments)]
+            )
+        );
+    }
+    blocks
+}
+
+/// The JSON body of a `/v1/messages` request. Consecutive tool results are merged into a
+/// single `user` turn, as the protocol requires.
+pub fn build_body(c: Config, tools: [Tool], history: [Message]) -> string {
+    body_of(c, tools, history, false)
+}
+
+/// The same body, asking the endpoint to stream the answer.
+pub fn build_stream_body(c: Config, tools: [Tool], history: [Message]) -> string {
+    body_of(c, tools, history, true)
+}
+
+fn body_of(c: Config, tools: [Tool], history: [Message], streaming: bool) -> string {
+    var messages: [Json] = [];
+    var pending: [Json] = [];
+    for m in history {
+        if (m.role == "tool") {
+            pending.push(
+                obj(
+                    ["type", "tool_use_id", "content"],
+                    [jstr("tool_result"), jstr(m.tool_call_id), jstr(m.text)]
+                )
+            );
+        } else {
+            if (pending.len() > 0) {
+                messages.push(obj(["role", "content"], [jstr("user"), Json.JArray(pending)]));
+                pending = [];
+            }
+            if (m.role == "assistant") {
+                messages.push(
+                    obj(["role", "content"], [jstr("assistant"), Json.JArray(assistant_blocks(m))])
+                );
+            } else {
+                let block = obj(["type", "text"], [jstr("text"), jstr(m.text)]);
+                messages.push(obj(["role", "content"], [jstr("user"), Json.JArray([block])]));
+            }
+        }
+    }
+    if (pending.len() > 0) {
+        messages.push(obj(["role", "content"], [jstr("user"), Json.JArray(pending)]));
+    }
+    var keys = ["model", "messages", "max_tokens"];
+    var values = [jstr(c.model), Json.JArray(messages), jint(c.max_tokens)];
+    if (c.system.trim() != "") {
+        keys.push("system");
+        values.push(jstr(c.system));
+    }
+    if (tools.len() > 0) {
+        var decls: [Json] = [];
+        for t in tools {
+            decls.push(tool_json(t));
+        }
+        keys.push("tools");
+        values.push(Json.JArray(decls));
+    }
+    if (streaming) {
+        keys.push("stream");
+        values.push(Json.JBool(true));
+    }
+    json.stringify(obj(keys, values))
+}
+
+/// The headers `/v1/messages` requires: API key and API version.
+pub fn headers(c: Config) -> Map<string, string> {
+    var h: Map<string, string> = Map.new();
+    h.insert("Content-Type", "application/json");
+    h.insert("Accept", "application/json");
+    h.insert("anthropic-version", VERSION);
+    if (c.api_key.trim() != "") {
+        h.insert("x-api-key", c.api_key);
+    }
+    h
+}
+
+fn string_or(j: Json, key: string, fallback: string) -> string {
+    match (json.get_string(j, key)) {
+        Option.Some(s) => s,
+        Option.None => fallback,
+    }
+}
+
+fn int_or(j: Json, key: string, fallback: int) -> int {
+    match (json.get_int(j, key)) {
+        Option.Some(n) => n,
+        Option.None => fallback,
+    }
+}
+
+/// Parses a `/v1/messages` response into the harness's canonical reply: text blocks are
+/// concatenated, `tool_use` blocks become tool calls, and the whole content array is kept
+/// verbatim so the next request can replay it.
+pub fn parse_reply(body: string) -> Result<Reply, string> {
+    let root = json.parse(body)?;
+    if (string_or(root, "type", "") == "error") {
+        let detail = match (json.member(root, "error")) {
+            Option.Some(e) => string_or(e, "message", json.stringify(e)),
+            Option.None => body,
+        };
+        return Result.Err("provider error: ${detail}");
+    }
+    let blocks = match (json.get_array(root, "content")) {
+        Option.Some(a) => a,
+        Option.None => {
+            return Result.Err("malformed response: no 'content' array");
+        },
+    };
+    var text = "";
+    var calls: [ToolCall] = [];
+    for b in blocks {
+        let kind = string_or(b, "type", "");
+        if (kind == "text") {
+            let piece = string_or(b, "text", "");
+            text = if (text == "") { piece } else { text + "\n" + piece };
+        } else if (kind == "tool_use") {
+            let input = match (json.member(b, "input")) {
+                Option.Some(i) => json.stringify(i),
+                Option.None => "{}",
+            };
+            calls.push(
+                ToolCall {
+                    id: string_or(b, "id", "call_${calls.len()}"),
+                    name: string_or(b, "name", ""),
+                    arguments: input
+                }
+            );
+        }
+    }
+    var used = Usage {
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_tokens: 0,
+        requests: 1,
+        latency_ms: 0,
+        measured: 0,
+        estimated: 0
+    };
+    match (json.member(root, "usage")) {
+        Option.Some(u) => {
+            used.input_tokens = int_or(u, "input_tokens", 0);
+            used.output_tokens = int_or(u, "output_tokens", 0);
+            used.cached_tokens = int_or(u, "cache_read_input_tokens", 0);
+        },
+        Option.None => { },
+    }
+    // Un `usage` ausente, nulo o en blanco NO es "cero tokens": es "no informado".
+    if (used.input_tokens > 0 || used.output_tokens > 0) {
+        used.measured = 1;
+    }
+    Result.Ok(
+        Reply {
+            message: message.assistant_raw(text, calls, json.stringify(Json.JArray(blocks))),
+            usage: used,
+            stop_reason: string_or(root, "stop_reason", ""),
+            model: string_or(root, "model", "")
+        }
+    )
+}
+
+// ---------------------------------------------------------------------------------------
+// Streaming: el ensamblado de una respuesta que llega por trozos
+// ---------------------------------------------------------------------------------------
+
+// Un bloque de contenido en construcción. Se guardan TODOS —también los de razonamiento,
+// con su firma— porque el turno siguiente los reenvía verbatim: perderlos invalidaría el
+// historial igual que perder un `tool_result`.
+struct StreamBlock {
+    kind: string,
+    text: string,
+    id: string,
+    name: string,
+    json: string,
+    signature: string,
+}
+
+/// A streamed answer under construction, fed one SSE payload at a time and ending as a
+/// normal `Reply`.
+pub struct Assembly {
+    blocks: [StreamBlock],
+    usage: Usage,
+    stop_reason: string,
+    model: string,
+    done: bool,
+}
+
+/// An empty assembly.
+pub fn assembly() -> Assembly {
+    let none: [StreamBlock] = [];
+    Assembly {
+        blocks: none,
+        usage: Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_tokens: 0,
+            requests: 1,
+            latency_ms: 0,
+            measured: 0,
+            estimated: 0
+        },
+        stop_reason: "",
+        model: "",
+        done: false
+    }
+}
+
+// El bloque en la posición `index`, creándolo si hace falta (los eventos traen el índice).
+fn block_at(a: Assembly, index: int) -> StreamBlock {
+    while (a.blocks.len() <= index) {
+        a.blocks.push(
+            StreamBlock { kind: "text", text: "", id: "", name: "", json: "", signature: "" }
+        );
+    }
+    a.blocks[index]
+}
+
+/// Absorbs one `data:` payload and returns the text it produced — what there is to paint
+/// right now. Unknown event types (`ping`, anything newer) are ignored.
+pub fn absorb(a: Assembly, data: string) -> string {
+    let root = match (json.parse(data.trim())) {
+        Result.Ok(j) => j,
+        Result.Err(_) => {
+            return "";
+        },
+    };
+    let kind = string_or(root, "type", "");
+    if (kind == "message_start") {
+        match (json.member(root, "message")) {
+            Option.Some(m) => {
+                a.model = string_or(m, "model", a.model);
+                match (json.member(m, "usage")) {
+                    Option.Some(u) => {
+                        a.usage.input_tokens = int_or(u, "input_tokens", 0);
+                        a.usage.cached_tokens = int_or(u, "cache_read_input_tokens", 0);
+                        a.usage.output_tokens = int_or(u, "output_tokens", 0);
+                        if (a.usage.input_tokens > 0 || a.usage.output_tokens > 0) {
+                            a.usage.measured = 1;
+                        }
+                    },
+                    Option.None => { },
+                }
+            },
+            Option.None => { },
+        }
+        return "";
+    }
+    if (kind == "content_block_start") {
+        let target = block_at(a, int_or(root, "index", 0));
+        match (json.member(root, "content_block")) {
+            Option.Some(b) => {
+                target.kind = string_or(b, "type", "text");
+                target.text = string_or(b, "text", string_or(b, "thinking", ""));
+                target.id = string_or(b, "id", "");
+                target.name = string_or(b, "name", "");
+                target.signature = string_or(b, "signature", "");
+            },
+            Option.None => { },
+        }
+        return "";
+    }
+    if (kind == "content_block_delta") {
+        let target = block_at(a, int_or(root, "index", 0));
+        match (json.member(root, "delta")) {
+            Option.Some(d) => {
+                let delta_kind = string_or(d, "type", "");
+                if (delta_kind == "text_delta") {
+                    let piece = string_or(d, "text", "");
+                    target.text = target.text + piece;
+                    return piece;
+                }
+                if (delta_kind == "thinking_delta") {
+                    // El razonamiento se guarda para reenviarlo, pero no se pinta.
+                    target.text = target.text + string_or(d, "thinking", "");
+                }
+                if (delta_kind == "signature_delta") {
+                    target.signature = target.signature + string_or(d, "signature", "");
+                }
+                if (delta_kind == "input_json_delta") {
+                    target.json = target.json + string_or(d, "partial_json", "");
+                }
+            },
+            Option.None => { },
+        }
+        return "";
+    }
+    if (kind == "message_delta") {
+        match (json.member(root, "delta")) {
+            Option.Some(d) => {
+                let reason = string_or(d, "stop_reason", "");
+                if (reason != "") {
+                    a.stop_reason = reason;
+                }
+            },
+            Option.None => { },
+        }
+        match (json.member(root, "usage")) {
+            Option.Some(u) => {
+                let output = int_or(u, "output_tokens", 0);
+                if (output > 0) {
+                    a.usage.output_tokens = output;
+                    a.usage.measured = 1;
+                }
+            },
+            Option.None => { },
+        }
+        return "";
+    }
+    if (kind == "message_stop") {
+        a.done = true;
+    }
+    ""
+}
+
+/// The assembled reply, with the content blocks rebuilt verbatim for the next request.
+pub fn assembled(a: Assembly) -> Reply {
+    var text = "";
+    var calls: [ToolCall] = [];
+    var blocks: [Json] = [];
+    for b in a.blocks {
+        if (b.kind == "text") {
+            text = if (text == "") { b.text } else { text + "\n" + b.text };
+            blocks.push(obj(["type", "text"], [jstr("text"), jstr(b.text)]));
+        } else if (b.kind == "tool_use") {
+            let arguments = if (b.json.trim() == "") { "{}" } else { b.json };
+            calls.push(
+                ToolCall { id: if (b.id == "") { "call_${calls.len()}" } else { b.id }, name: b.name, arguments: arguments }
+            );
+            blocks.push(
+                obj(
+                    ["type", "id", "name", "input"],
+                    [jstr("tool_use"), jstr(b.id), jstr(b.name), arguments_json(arguments)]
+                )
+            );
+        } else if (b.kind == "thinking") {
+            blocks.push(
+                obj(
+                    ["type", "thinking", "signature"],
+                    [jstr("thinking"), jstr(b.text), jstr(b.signature)]
+                )
+            );
+        }
+    }
+    Reply {
+        message: message.assistant_raw(text, calls, json.stringify(Json.JArray(blocks))),
+        usage: a.usage,
+        stop_reason: a.stop_reason,
+        model: a.model
+    }
+}

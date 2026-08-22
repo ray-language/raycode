@@ -1,0 +1,589 @@
+// Pruebas del harness: resolución de configuración, traducción a cada protocolo y
+// contabilidad. No tocan la red: se ejercita el par construir-cuerpo / parsear-respuesta.
+import src/config;
+import src/openai;
+import src/anthropic;
+import src/tools;
+import src/usage;
+import src/ui;
+import src/message;
+import src/lineedit;
+import src/client;
+import std/time;
+import std/fs;
+import src/render;
+from src/config import Api;
+
+fn base_config(profile: string) -> config.Config {
+    match (config.load(["-p", profile, "-m", "test-model", "-u", "http://localhost:9999"])) {
+        Result.Ok(c) => c,
+        Result.Err(e) => panic(e),
+    }
+}
+
+@test
+fn chat_url_follows_the_protocol() {
+    assert_eq(config.chat_url(base_config("llama")), "http://localhost:9999/v1/chat/completions");
+    assert_eq(config.chat_url(base_config("anthropic")), "http://localhost:9999/v1/messages");
+}
+
+@test
+fn a_base_url_with_v1_is_not_doubled() {
+    match (config.load(
+    ["-u", "https://api.groq.com/openai/v1/", "-m", "m"]
+)) {
+        Result.Ok(c) => assert_eq(config.chat_url(c), "https://api.groq.com/openai/v1/chat/completions"),
+        Result.Err(e) => panic(e),
+    }
+}
+
+@test
+fn an_unknown_flag_is_rejected() {
+    match (config.load(["--nope"])) {
+        Result.Ok(_) => panic("expected an error"),
+        Result.Err(e) => assert(e.contains("--nope")),
+    }
+}
+
+@test
+fn openai_bodies_carry_system_tools_and_history() {
+    let c = base_config("llama");
+    let body = openai.build_body(c, tools.registry(false), [message.user("hi")]);
+    assert(body.contains("\"role\":\"system\""));
+    assert(body.contains("\"role\":\"user\""));
+    assert(body.contains("\"name\":\"read_file\""));
+    assert(body.contains("\"stream\":false"));
+}
+
+@test
+fn openai_replies_become_tool_calls() {
+    let raw = `{"model":"m","choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"list_dir","arguments":"{\\"path\\":\\".\\"}"}}]}}],"usage":{"prompt_tokens":10,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":6}}}`;
+    match (openai.parse_reply(raw)) {
+        Result.Err(e) => panic(e),
+        Result.Ok(r) => {
+            assert_eq(r.message.tool_calls.len(), 1);
+            assert_eq(r.message.tool_calls[0].name, "list_dir");
+            assert_eq(r.message.tool_calls[0].arguments, `{"path":"."}`);
+            assert_eq(r.usage.input_tokens, 10);
+            assert_eq(r.usage.output_tokens, 4);
+            assert_eq(r.usage.cached_tokens, 6);
+            assert_eq(r.usage.measured, 1);
+            assert_eq(r.stop_reason, "tool_calls");
+        },
+    }
+}
+
+@test
+fn an_openai_error_payload_is_an_error() {
+    match (openai.parse_reply(`{"error":{"message":"bad key"}}`)) {
+        Result.Ok(_) => panic("expected an error"),
+        Result.Err(e) => assert(e.contains("bad key")),
+    }
+}
+
+@test
+fn anthropic_merges_consecutive_tool_results() {
+    let c = base_config("anthropic");
+    let calls = [
+        message.ToolCall { id: "a", name: "list_dir", arguments: "{}" },
+        message.ToolCall { id: "b", name: "list_dir", arguments: "{}" }
+    ];
+    let history = [
+        message.user("hi"),
+        message.assistant("", calls),
+        message.tool_result("a", "one"),
+        message.tool_result("b", "two")
+    ];
+    let body = anthropic.build_body(c, [], history);
+    // Los dos resultados viajan en un ÚNICO turno de usuario, como exige el protocolo.
+    assert_eq(body.split("\"role\":\"user\"").len() - 1, 2);
+    assert(body.contains("\"tool_use_id\":\"a\""));
+    assert(body.contains("\"tool_use_id\":\"b\""));
+    assert(body.contains("\"system\""));
+}
+
+@test
+fn anthropic_assistant_blocks_are_replayed_verbatim() {
+    let raw = `{"type":"message","model":"claude-opus-5","stop_reason":"tool_use","content":[{"type":"thinking","thinking":"","signature":"sig"},{"type":"tool_use","id":"t1","name":"read_file","input":{"path":"x"}}],"usage":{"input_tokens":9,"output_tokens":3,"cache_read_input_tokens":2}}`;
+    match (anthropic.parse_reply(raw)) {
+        Result.Err(e) => panic(e),
+        Result.Ok(r) => {
+            assert_eq(r.message.tool_calls.len(), 1);
+            assert_eq(r.message.tool_calls[0].arguments, `{"path":"x"}`);
+            assert(r.message.raw.contains("sig"));
+            let body = anthropic.build_body(base_config("anthropic"), [], [r.message]);
+            assert(body.contains("\"signature\":\"sig\""));
+        },
+    }
+}
+
+@test
+fn tool_failures_come_back_as_text() {
+    let reg = tools.registry(false);
+    assert(tools.execute(reg, "nope", "{}").contains("unknown tool"));
+    assert(tools.execute(reg, "read_file", "not json").contains("not valid JSON"));
+    assert(tools.execute(reg, "read_file", "{}").contains("missing required string"));
+    assert(tools.execute(reg, "read_file", `{"path":"/nonexistent/x"}`).starts_with("error:"));
+}
+
+@test
+fn the_shell_tool_is_opt_in() {
+    assert_eq(tools.registry(false).len(), 3);
+    assert_eq(tools.registry(true).len(), 4);
+    assert(tools.offers(tools.registry(true), "run_command"));
+    assert(!tools.offers(tools.registry(false), "run_command"));
+    // Y sin `--allow-exec` no se ejecuta aunque el modelo lo pida por su nombre.
+    assert(tools
+        .execute(tools.registry(false), "run_command", `{"command":"echo no"}`)
+        .contains("unknown tool"));
+}
+
+@test
+fn usage_accumulates_and_measures_speed() {
+    let a = usage.Usage {
+        input_tokens: 10,
+        output_tokens: 20,
+        cached_tokens: 1,
+        requests: 1,
+        latency_ms: 500,
+        measured: 1,
+        estimated: 0
+    };
+    let total = usage.add(usage.add(usage.zero(), a), a);
+    assert_eq(usage.total_tokens(total), 60);
+    assert_eq(total.requests, 2);
+    assert_eq(usage.output_speed(total), 40.0);
+    assert_eq(usage.output_speed(usage.zero()), 0.0);
+}
+
+@test
+fn formatters_are_readable() {
+    assert_eq(ui.fmt_count(1234567), "1,234,567");
+    assert_eq(ui.fmt_count(0), "0");
+    assert_eq(ui.fmt_float(3.14159, 2), "3.14");
+    assert_eq(ui.fmt_millis(850), "850ms");
+    assert_eq(ui.fmt_millis(1500), "1.5s");
+    assert_eq(ui.fmt_millis(90000), "1m 30s");
+    assert_eq(ui.clip("abcdef", 3), "abc…");
+}
+
+@test
+fn tab_completes_slash_commands() {
+    let cmds = ["/help", "/usage", "/tools", "/exit"];
+    assert_eq(lineedit.candidates("/he", 3, cmds), ["/help"]);
+    assert_eq(lineedit.candidates("/", 1, cmds), ["/exit", "/help", "/tools", "/usage"]);
+    // Una orden que no existe no es una orden: se completa como ruta absoluta.
+    assert_eq(lineedit.candidates("/zzz", 4, cmds).len(), 0);
+}
+
+@test
+fn tab_completes_paths_in_any_other_position() {
+    let cmds = ["/help"];
+    // El directorio del proyecto tiene `src/` y `tests/`: el prefijo común los distingue.
+    let roots = lineedit.candidates("read s", 6, cmds);
+    assert(roots.contains("src/"));
+    let inside = lineedit.candidates("read src/line", 13, cmds);
+    assert_eq(inside, ["src/lineedit.ray"]);
+    // Una orden en primera posición no impide completar rutas después.
+    assert(lineedit.candidates("/system READ", 12, cmds).contains("README.md"));
+}
+
+@test
+fn the_common_prefix_is_what_a_tab_can_insert() {
+    assert_eq(lineedit.common_prefix(["src/ui.ray", "src/usage.ray"]), "src/u");
+    assert_eq(lineedit.common_prefix(["/help"]), "/help");
+    assert_eq(lineedit.common_prefix([]), "");
+}
+
+@test
+fn a_reply_without_usage_is_not_zero_usage() {
+    // Hay endpoints que no mandan `usage`: eso es "no informado", no "cero tokens".
+    match (openai.parse_reply(
+        `{"model":"m","choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"hi"}}]}`
+    )) {
+        Result.Err(e) => panic(e),
+        Result.Ok(r) => {
+            assert_eq(r.usage.measured, 0);
+            assert_eq(r.usage.requests, 1);
+        },
+    }
+    match (anthropic.parse_reply(
+    `{"type":"message","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":0,"output_tokens":0}}`
+)) {
+        Result.Err(e) => panic(e),
+        Result.Ok(r) => assert_eq(r.usage.measured, 0),
+    }
+}
+
+@test
+fn the_usage_line_reports_tokens_requests_and_speed() {
+    let measured = usage.Usage {
+        input_tokens: 1200,
+        output_tokens: 300,
+        cached_tokens: 100,
+        requests: 2,
+        latency_ms: 1500,
+        measured: 2,
+        estimated: 0
+    };
+    let line = ui.usage_line(measured);
+    assert(line.contains("1,200 in"));
+    assert(line.contains("300 out"));
+    assert(line.contains("cache 100"));
+    assert(line.contains("2 req"));
+    assert(line.contains("1.5s"));
+    assert(line.contains("200.0 tok/s"));
+    assert(!line.contains("≈"));
+    // Lo estimado se marca; lo informado, no.
+    let guessed = usage.Usage {
+        input_tokens: 40,
+        output_tokens: 10,
+        cached_tokens: 0,
+        requests: 1,
+        latency_ms: 100,
+        measured: 0,
+        estimated: 1
+    };
+    assert(usage.is_estimate(guessed));
+    assert(ui.usage_line(guessed).contains("≈"));
+}
+
+@test
+fn the_shell_tool_returns_the_command_output() {
+    let reg = tools.registry(true);
+    let out = tools.execute(reg, "run_command", `{"command":"echo hola-raycode"}`);
+    assert(out.contains("hola-raycode"));
+    assert(out.contains("exit 0"));
+}
+
+@test
+fn the_model_catalogue_is_read_in_every_shape_servers_use() {
+    // Sobre de OpenAI (llama.cpp, opencode, la mayoría de proxies).
+    assert_eq(
+        client.parse_model_list(`{"object":"list","data":[{"id":"b","object":"model"},{"id":"a"}]}`),
+        ["a", "b"]
+    );
+    // Arreglo pelado de objetos, envoltorio `models`, y arreglo de cadenas.
+    assert_eq(client.parse_model_list(`[{"id":"x"},{"name":"y"}]`), ["x", "y"]);
+    assert_eq(client.parse_model_list(`{"models":[{"id":"m"}]}`), ["m"]);
+    assert_eq(client.parse_model_list(`["s2","s1"]`), ["s1", "s2"]);
+    // Nada aprovechable: lista vacía, nunca un fallo.
+    assert_eq(client.parse_model_list(`{"error":"nope"}`).len(), 0);
+    assert_eq(client.parse_model_list("not json").len(), 0);
+}
+
+@test
+fn the_shell_tool_honours_its_timeout() {
+    let reg = tools.registry(true);
+    let started = time.monotonic();
+    let out = tools.execute(
+        reg,
+        "run_command",
+        `{"command":"echo antes; sleep 5; echo despues","timeout_ms":800}`
+    );
+    let elapsed = time.monotonic() - started;
+    // Se corta por el plazo, no a los 5 s, y lo dice; lo ya escrito se conserva.
+    assert(elapsed < 3000);
+    assert(out.contains("timed out"));
+    assert(out.contains("antes"));
+    assert(!out.contains("despues"));
+}
+
+@test
+fn the_terminal_width_always_has_a_sane_value() {
+    // Sin terminal (así corre `ray test`) debe caer en el ancho por defecto, nunca en 0:
+    // el repintado divide por él.
+    assert(ui.width() >= 20);
+    assert(!ui.interactive());
+}
+
+@test
+fn markdown_marks_are_rendered_not_shown() {
+    let bold = render.markdown_text("dice **hola** ahora", 60);
+    assert(bold.contains("hola"));
+    assert(!bold.contains("**"));
+    let italic = render.markdown_text("dice *hola* ahora", 60);
+    assert(!italic.contains("*"));
+    let code = render.markdown_text("usa `ray test` hoy", 60);
+    assert(code.contains("ray test"));
+    assert(!code.contains("`"));
+    let heading = render.markdown_text("## Etapas", 60);
+    assert(heading.contains("Etapas"));
+    assert(!heading.contains("#"));
+    let bullet = render.markdown_text("- uno", 60);
+    assert(bullet.contains("•"));
+    let ordered = render.markdown_text("1. uno\n2. dos", 60);
+    assert(ordered.contains("1."));
+    assert(ordered.contains("2."));
+    assert(render.markdown_text("---", 40).contains("─"));
+    let link = render.markdown_text("ver [la guía](https://x.dev) hoy", 60);
+    assert(link.contains("la guía"));
+    assert(link.contains("https://x.dev"));
+    assert(!link.contains("]("));
+}
+
+@test
+fn markdown_leaves_fenced_code_alone() {
+    // Dentro de una cerca no se interpreta nada: el código se lee y se copia tal cual.
+    let fenced = render.markdown_text("```raylang\nlet x = a ** b;\n```", 60);
+    assert(fenced.contains("let x = a ** b;"));
+    assert(fenced.contains("┌ raylang"));
+    // Un delimitador que nunca cierra se queda como texto.
+    assert(render.markdown_text("sin **par aquí", 60).contains("**par"));
+}
+
+@test
+fn markdown_tables_line_up_their_columns() {
+    let table = render.markdown_text(
+        "| Habilidad | Nivel |\n|---|---:|\n| Arquitectura | alto |\n| Seguridad | medio |",
+        60
+    );
+    let lines = table.split("\n");
+    // Cabecera, separadora y dos filas, todas del mismo ancho visible.
+    assert_eq(lines.len(), 4);
+    let reference = render.visible_len(lines[0]);
+    for line in lines {
+        assert_eq(render.visible_len(line), reference);
+    }
+    // La alineación a la derecha deja el valor pegado al borde de su columna.
+    assert(lines[2].ends_with("alto"));
+    assert(lines[3].ends_with("medio"));
+}
+
+@test
+fn markdown_renders_nested_lists() {
+    let nested = render.markdown_text("- uno\n  - dentro\n- dos", 60);
+    let lines = nested.split("\n");
+    assert_eq(lines.len(), 3);
+    // El ítem anidado se sangra bajo su padre.
+    assert(lines[1].starts_with("  "));
+    assert(!lines[0].starts_with(" "));
+}
+
+@test
+fn markdown_wraps_to_the_terminal_width() {
+    let text = "una linea larga de palabras cortas que debe repartirse en varias filas del terminal";
+    let rendered = render.markdown_text(text, 30);
+    let lines = rendered.split("\n");
+    assert(lines.len() > 2);
+    for line in lines {
+        assert(render.visible_len(line) <= 30);
+    }
+    // La sangría de una lista se mantiene en las filas siguientes.
+    let item = render.markdown_text(
+        "- un elemento con bastante texto para que tenga que repartirse",
+        30
+    );
+    let rows = item.split("\n");
+    assert(rows.len() > 1);
+    assert(rows[1].starts_with("  "));
+}
+
+@test
+fn markdown_sets_the_vertical_rhythm() {
+    let text = "Intro\n## Sección\n- uno\n- dos\n\n\n\n### Otra\n| a | b |\n| c | d |\nFin";
+    let lines = render.markdown_text(text, 60).split("\n");
+    // Ni al principio ni al final sobra aire, y nunca hay dos blancos seguidos.
+    assert(lines[0] != "");
+    assert(lines[lines.len() - 1] != "");
+    var previous_blank = false;
+    for line in lines {
+        assert(!(line == "" && previous_blank));
+        previous_blank = line == "";
+    }
+    // Un título abre sección: lleva blanco delante y detrás.
+    var i = 0;
+    var checked = 0;
+    while (i < lines.len()) {
+        if (lines[i].contains("Sección") || lines[i].contains("Otra")) {
+            assert_eq(lines[i - 1], "");
+            assert_eq(lines[i + 1], "");
+            checked = checked + 1;
+        }
+        i = i + 1;
+    }
+    assert_eq(checked, 2);
+    // Las filas de una lista o de una tabla no se separan entre sí.
+    let items = render.markdown_text("- uno\n- dos", 60).split("\n");
+    assert_eq(items.len(), 2);
+    let rows = render.markdown_text("| a | b |\n| c | d |", 60).split("\n");
+    assert_eq(rows.len(), 2);
+}
+
+@test
+fn a_truncated_answer_is_recognised_in_both_protocols() {
+    // El tope de tokens deja la respuesta a medias, y cada protocolo lo dice a su manera.
+    assert(message.was_truncated("length"));
+    assert(message.was_truncated("max_tokens"));
+    assert(!message.was_truncated("stop"));
+    assert(!message.was_truncated("end_turn"));
+    assert(!message.was_truncated("tool_calls"));
+    assert(!message.was_truncated(""));
+    // Y el motivo llega intacto desde la respuesta del proveedor.
+    match (openai.parse_reply(
+        `{"model":"m","choices":[{"finish_reason":"length","message":{"role":"assistant","content":"a medias"}}]}`
+    )) {
+        Result.Err(e) => panic(e),
+        Result.Ok(r) => assert(message.was_truncated(r.stop_reason)),
+    }
+    match (anthropic.parse_reply(
+    `{"type":"message","content":[{"type":"text","text":"a medias"}],"stop_reason":"max_tokens"}`
+)) {
+        Result.Err(e) => panic(e),
+        Result.Ok(r) => assert(message.was_truncated(r.stop_reason)),
+    }
+}
+
+@test
+fn raw_mode_output_keeps_its_carriage_returns() {
+    // En modo crudo el terminal no traduce nada: sin CR, un bloque de varias líneas
+    // (la salida de una herramienta) sale en escalera.
+    assert_eq(ui.crlf("una"), "una\r\n");
+    assert_eq(ui.crlf("una\ndos\ntres"), "una\r\ndos\r\ntres\r\n");
+    assert_eq(ui.crlf(""), "\r\n");
+}
+
+@test
+fn a_streamed_openai_answer_is_assembled_from_its_chunks() {
+    let a = openai.assembly();
+    // El texto llega partido en trozos arbitrarios…
+    assert_eq(openai.absorb(a, `{"model":"m","choices":[{"delta":{"content":"Hola "}}]}`), "Hola ");
+    assert_eq(openai.absorb(a, `{"choices":[{"delta":{"content":"mundo"}}]}`), "mundo");
+    // …y los argumentos de una herramienta, también.
+    let _ = openai.absorb(
+        a,
+        `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_9","function":{"name":"list_dir","arguments":"{\\"pa"}}]}}]}`
+    );
+    let _ = openai.absorb(
+        a,
+        `{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\\":\\".\\"}"}}]}}]}`
+    );
+    let _ = openai.absorb(a, `{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`);
+    let _ = openai.absorb(a, `{"choices":[],"usage":{"prompt_tokens":30,"completion_tokens":7}}`);
+    let _ = openai.absorb(a, "[DONE]");
+    let reply = openai.assembled(a);
+    assert_eq(reply.message.text, "Hola mundo");
+    assert_eq(reply.message.tool_calls.len(), 1);
+    assert_eq(reply.message.tool_calls[0].name, "list_dir");
+    assert_eq(reply.message.tool_calls[0].arguments, `{"path":"."}`);
+    assert_eq(reply.message.tool_calls[0].id, "call_9");
+    assert_eq(reply.stop_reason, "tool_calls");
+    assert_eq(reply.usage.input_tokens, 30);
+    assert_eq(reply.usage.output_tokens, 7);
+    assert_eq(reply.usage.measured, 1);
+    assert_eq(reply.model, "m");
+}
+
+@test
+fn a_streamed_anthropic_answer_keeps_its_blocks() {
+    let a = anthropic.assembly();
+    let _ = anthropic.absorb(
+        a,
+        `{"type":"message_start","message":{"model":"claude-opus-5","usage":{"input_tokens":20,"cache_read_input_tokens":8,"output_tokens":1}}}`
+    );
+    // Un bloque de razonamiento: no se pinta, pero se guarda con su firma para reenviarlo.
+    let _ = anthropic.absorb(
+        a,
+        `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`
+    );
+    let _ = anthropic.absorb(
+        a,
+        `{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig123"}}`
+    );
+    // Un bloque de texto, en dos trozos.
+    let _ = anthropic.absorb(
+        a,
+        `{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}`
+    );
+    assert_eq(
+        anthropic.absorb(
+            a,
+            `{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Voy a mirar"}}`
+        ),
+        "Voy a mirar"
+    );
+    // Y una herramienta cuyos argumentos llegan partidos.
+    let _ = anthropic.absorb(
+        a,
+        `{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_7","name":"read_file"}}`
+    );
+    let _ = anthropic.absorb(
+        a,
+        `{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":"}}`
+    );
+    let _ = anthropic.absorb(
+        a,
+        `{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"\\"x.ray\\"}"}}`
+    );
+    let _ = anthropic.absorb(
+        a,
+        `{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":42}}`
+    );
+    let _ = anthropic.absorb(a, `{"type":"message_stop"}`);
+    let reply = anthropic.assembled(a);
+    assert_eq(reply.message.text, "Voy a mirar");
+    assert_eq(reply.message.tool_calls.len(), 1);
+    assert_eq(reply.message.tool_calls[0].name, "read_file");
+    assert_eq(reply.message.tool_calls[0].arguments, `{"path":"x.ray"}`);
+    assert_eq(reply.stop_reason, "tool_use");
+    assert_eq(reply.usage.input_tokens, 20);
+    assert_eq(reply.usage.output_tokens, 42);
+    assert_eq(reply.usage.cached_tokens, 8);
+    // Lo que se reenvía lleva el bloque de razonamiento con su firma.
+    assert(reply.message.raw.contains("sig123"));
+    assert(reply.message.raw.contains("thinking"));
+    let replay = anthropic.build_body(base_config("anthropic"), [], [reply.message]);
+    assert(replay.contains("\"signature\":\"sig123\""));
+}
+
+@test
+fn markdown_respects_the_document_over_its_own_conventions() {
+    // Una lista ordenada empieza donde diga el documento.
+    let numbered = render.markdown_text("3. tres\n4. cuatro", 60);
+    assert(numbered.contains("3."));
+    assert(numbered.contains("4."));
+    // Y un identificador con guiones bajos sigue siendo un identificador, no una cursiva.
+    let snake = render.markdown_text("el campo snake_case_name del struct", 60);
+    assert(snake.contains("snake_case_name"));
+}
+
+@test
+fn reading_a_huge_file_stays_bounded() {
+    // Un archivo de 3 MiB: la herramienta lee por trozos y para en su tope, en vez de
+    // traerlo entero a memoria. Y lo dice, para que el modelo no crea que lo ha visto todo.
+    let path = "/tmp/raycode_huge.txt";
+    var block = "";
+    var i = 0;
+    while (i < 1024) {
+        block = block + "0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqr\n";
+        i = i + 1;
+    }
+    var content = "";
+    i = 0;
+    while (i < 48) {
+        content = content + block;
+        i = i + 1;
+    }
+    match (fs.write_file(path, content)) {
+        Result.Ok(_) => { },
+        Result.Err(e) => panic(e),
+    }
+    let reg = tools.registry(false);
+    let out = tools.execute(reg, "read_file", `{"path":"/tmp/raycode_huge.txt","max_lines":5}`);
+    assert(out.contains("1: 0123456789"));
+    assert(out.contains("were read"));
+    let _ = fs.remove_file(path);
+}
+
+@test
+fn paths_resolve_against_the_workspace() {
+    // Sin espacio de trabajo aparte (lo normal, y como corre `ray test`), las rutas van
+    // tal cual: el directorio del proceso YA es el del usuario.
+    assert_eq(ui.workspace(), ".");
+    assert_eq(ui.resolve_path("src/agent.ray"), "src/agent.ray");
+    assert_eq(ui.resolve_path("."), ".");
+    assert_eq(ui.resolve_path("/etc/hosts"), "/etc/hosts");
+    // Y las herramientas siguen leyendo del directorio actual.
+    let reg = tools.registry(false);
+    assert(tools.execute(reg, "read_file", `{"path":"ray.toml"}`).contains("raycode"));
+}

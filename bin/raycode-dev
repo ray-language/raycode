@@ -1,0 +1,15 @@
+#!/bin/sh
+# Lanzador de DESARROLLO: ejecuta el código fuente tal cual esté, desde cualquier
+# directorio. Lo instalado (`bin/raycode`) es el binario nativo; esto sirve para probar un
+# cambio sin reconstruirlo.
+#
+# `ray run` resuelve las dependencias del proyecto contra el DIRECTORIO ACTUAL, no contra
+# el proyecto del archivo que se le pasa, así que el lanzador se coloca en el proyecto y le
+# pasa aparte el directorio desde el que se invocó: ese es el espacio de trabajo sobre el
+# que operan las herramientas del agente (read_file, write_file, list_dir, run_command).
+#
+PROJECT="/Users/roberto/Dev/Rayala/labs/ray-apps/raycode"
+RAYCODE_WORKSPACE="${RAYCODE_WORKSPACE:-$PWD}"
+export RAYCODE_WORKSPACE
+cd "$PROJECT" || exit 1
+exec ray run main.ray "$@"

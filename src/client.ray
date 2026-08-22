@@ -1,0 +1,465 @@
+// El transporte: una petición HTTP por turno, cronometrada, con el cuerpo y las cabeceras
+// que dicte el protocolo del perfil. También interroga al endpoint sobre el modelo actual
+// para el banner (`/props` de llama.cpp, `/v1/models` de OpenAI, `/v1/models/{id}` de
+// Anthropic); si no contesta, el harness sigue con lo que dice la configuración.
+import net/http;
+import net/sse;
+import std/json;
+import std/time;
+from std/json import Json;
+from src/config import Config, Api;
+import src/config;
+from src/message import Message, Reply;
+from src/tools import Tool;
+import src/anthropic;
+import src/openai;
+
+/// What the endpoint says about the model actually loaded behind it.
+pub struct ModelInfo {
+    name: string,
+    context: int,
+    detail: string,
+}
+
+// La URL base sin barra final ni sufijo de ruta de API.
+fn root_url(c: Config) -> string {
+    var base = c.base_url;
+    while (base.ends_with("/")) {
+        base = base.substring(0, base.len() - 1);
+    }
+    if (base.ends_with("/v1")) { base.substring(0, base.len() - 3) } else { base }
+}
+
+fn headers_of(c: Config) -> Map<string, string> {
+    match (c.api) {
+        Api.Anthropic => anthropic.headers(c),
+        Api.OpenAI => openai.headers(c),
+    }
+}
+
+fn body_of(c: Config, tools: [Tool], history: [Message]) -> string {
+    match (c.api) {
+        Api.Anthropic => anthropic.build_body(c, tools, history),
+        Api.OpenAI => openai.build_body(c, tools, history),
+    }
+}
+
+fn parse_of(c: Config, body: string) -> Result<Reply, string> {
+    match (c.api) {
+        Api.Anthropic => anthropic.parse_reply(body),
+        Api.OpenAI => openai.parse_reply(body),
+    }
+}
+
+/// One completion round-trip: builds the request for the configured protocol, times it,
+/// and returns the canonical reply with the measured latency already in its usage.
+/// A non-2xx status comes back as an Err carrying the status and the body.
+pub fn send(c: Config, tools: [Tool], history: [Message]) -> Result<Reply, string> {
+    let url = config.chat_url(c);
+    let body = body_of(c, tools, history);
+    if (c.verbose) {
+        eprint("→ POST ${url} (${body.len()} chars)");
+    }
+    let started = time.monotonic();
+    let response = http.request_bytes("POST", url, body.to_bytes(), headers_of(c), c.timeout_ms)?;
+    let elapsed = time.monotonic() - started;
+    let text = http.body_text(response)?;
+    if (c.verbose) {
+        eprint("← ${response.status} in ${elapsed}ms (${text.len()} chars)");
+    }
+    if (response.status < 200 || response.status >= 300) {
+        return Result.Err("HTTP ${response.status} from ${url}: ${short(text)}");
+    }
+    var reply = parse_of(c, text)?;
+    reply.usage.latency_ms = elapsed;
+    // Hay endpoints que no devuelven `usage` (o lo devuelven nulo). Antes que enseñar
+    // ceros —que se leen como "no gastó nada"— se cuenta en local y se marca como
+    // estimación: ~4 caracteres por token, la regla de bolsillo para texto latino.
+    if (reply.usage.measured == 0) {
+        reply.usage.input_tokens = estimate_tokens(body);
+        reply.usage.output_tokens = estimate_tokens(produced_text(reply.message));
+        reply.usage.estimated = 1;
+    }
+    if (reply.model.trim() == "") {
+        reply.model = c.model;
+    }
+    Result.Ok(reply)
+}
+
+// ~4 caracteres por token, redondeando hacia arriba.
+fn estimate_tokens(text: string) -> int {
+    (text.len() + 3) / 4
+}
+
+// Todo lo que el modelo generó en un turno: el texto y los argumentos de sus llamadas.
+fn produced_text(m: Message) -> string {
+    var all = m.text;
+    for call in m.tool_calls {
+        all = all + call.name + call.arguments;
+    }
+    all
+}
+
+// El cuerpo con `stream: true` según el protocolo.
+fn stream_body_of(c: Config, tools: [Tool], history: [Message]) -> string {
+    match (c.api) {
+        Api.Anthropic => anthropic.build_stream_body(c, tools, history),
+        Api.OpenAI => openai.build_stream_body(c, tools, history),
+    }
+}
+
+/// One streamed round-trip: the answer is painted through `paint` as it arrives, piece by
+/// piece, and the assembled `Reply` comes back exactly as the non-streaming path would
+/// deliver it — same tool calls, same usage, same stop reason.
+///
+/// The transport is the HTTP client's stream (status and headers first, body in chunks as
+/// they land) decoded with the SSE decoder: an event can be split across chunks, even in
+/// the middle of a UTF-8 character, so the tail that does not decode yet is kept.
+pub fn send_stream(
+    c: Config,
+    tools: [Tool],
+    history: [Message],
+    paint: fn(string) -> unit
+) -> Result<Reply, string> {
+    let url = config.chat_url(c);
+    let body = stream_body_of(c, tools, history);
+    if (c.verbose) {
+        eprint("→ POST ${url} (stream, ${body.len()} chars)");
+    }
+    let started = time.monotonic();
+    let stream = http.stream_with("POST", url, body.to_bytes(), headers_of(c), c.timeout_ms)?;
+    if (stream.status < 200 || stream.status >= 300) {
+        let detail = drain(stream);
+        return Result.Err("HTTP ${stream.status} from ${url}: ${short(detail)}");
+    }
+    var reply = match (c.api) {
+        Api.Anthropic => stream_anthropic(stream, paint),
+        Api.OpenAI => stream_openai(stream, paint),
+    }?;
+    http.stream_close(stream);
+    reply.usage.latency_ms = time.monotonic() - started;
+    if (reply.model.trim() == "") {
+        reply.model = c.model;
+    }
+    if (reply.usage.measured == 0) {
+        reply.usage.input_tokens = estimate_tokens(body);
+        reply.usage.output_tokens = estimate_tokens(produced_text(reply.message));
+        reply.usage.estimated = 1;
+    }
+    Result.Ok(reply)
+}
+
+// Lo que quede del cuerpo, para poder explicar un error del proveedor.
+fn drain(stream: http.Stream) -> string {
+    var acc: bytes = b"";
+    var reading = true;
+    while (reading && acc.len() < 4096) {
+        match (http.stream_read(stream)) {
+            Result.Ok(chunk) => match (chunk) {
+                Option.Some(part) => {
+                    acc = acc + part;
+                },
+                Option.None => {
+                    reading = false;
+                },
+            },
+            Result.Err(_) => {
+                reading = false;
+            },
+        }
+    }
+    http.stream_close(stream);
+    match (from_utf8(acc)) {
+        Result.Ok(t) => t,
+        Result.Err(_) => "",
+    }
+}
+
+fn stream_openai(stream: http.Stream, paint: fn(string) -> unit) -> Result<Reply, string> {
+    let a = openai.assembly();
+    var acc: bytes = b"";
+    // Copia entera del cuerpo: si el endpoint IGNORA `stream: true` y contesta un JSON
+    // normal, no habrá ni un evento que decodificar y hay que leerlo como respuesta suelta
+    // en vez de devolver una respuesta en blanco.
+    var whole: bytes = b"";
+    var events = 0;
+    var reading = true;
+    while (reading) {
+        var decoding = true;
+        while (decoding) {
+            match (sse.decode(acc)) {
+                Option.Some(decoded) => {
+                    acc = acc.sub_bytes(decoded.1, acc.len());
+                    events = events + 1;
+                    let piece = openai.absorb(a, decoded.0.data);
+                    if (piece != "") {
+                        paint(piece);
+                    }
+                },
+                Option.None => {
+                    decoding = false;
+                },
+            }
+        }
+        match (http.stream_read(stream)) {
+            Result.Ok(chunk) => match (chunk) {
+                Option.Some(part) => {
+                    acc = acc + part;
+                    whole = whole + part;
+                },
+                Option.None => {
+                    reading = false;
+                },
+            },
+            Result.Err(e) => {
+                return Result.Err("error reading the stream: ${e}");
+            },
+        }
+    }
+    if (events == 0) {
+        let body = from_utf8(whole)?;
+        let reply = openai.parse_reply(body)?;
+        // El texto no se pintó por trozos (no los hubo): se pinta ahora, de una vez.
+        if (reply.message.text != "") {
+            paint(reply.message.text);
+        }
+        return Result.Ok(reply);
+    }
+    Result.Ok(openai.assembled(a))
+}
+
+fn stream_anthropic(stream: http.Stream, paint: fn(string) -> unit) -> Result<Reply, string> {
+    let a = anthropic.assembly();
+    var acc: bytes = b"";
+    // Copia entera del cuerpo: si el endpoint IGNORA `stream: true` y contesta un JSON
+    // normal, no habrá ni un evento que decodificar y hay que leerlo como respuesta suelta
+    // en vez de devolver una respuesta en blanco.
+    var whole: bytes = b"";
+    var events = 0;
+    var reading = true;
+    while (reading) {
+        var decoding = true;
+        while (decoding) {
+            match (sse.decode(acc)) {
+                Option.Some(decoded) => {
+                    acc = acc.sub_bytes(decoded.1, acc.len());
+                    events = events + 1;
+                    let piece = anthropic.absorb(a, decoded.0.data);
+                    if (piece != "") {
+                        paint(piece);
+                    }
+                },
+                Option.None => {
+                    decoding = false;
+                },
+            }
+        }
+        match (http.stream_read(stream)) {
+            Result.Ok(chunk) => match (chunk) {
+                Option.Some(part) => {
+                    acc = acc + part;
+                    whole = whole + part;
+                },
+                Option.None => {
+                    reading = false;
+                },
+            },
+            Result.Err(e) => {
+                return Result.Err("error reading the stream: ${e}");
+            },
+        }
+    }
+    if (events == 0) {
+        let body = from_utf8(whole)?;
+        let reply = anthropic.parse_reply(body)?;
+        // El texto no se pintó por trozos (no los hubo): se pinta ahora, de una vez.
+        if (reply.message.text != "") {
+            paint(reply.message.text);
+        }
+        return Result.Ok(reply);
+    }
+    Result.Ok(anthropic.assembled(a))
+}
+
+// Un fragmento del cuerpo para los mensajes de error: lo bastante para diagnosticar.
+fn short(s: string) -> string {
+    if (s.len() <= 400) { s } else { s.substring(0, 400) + "…" }
+}
+
+fn string_or(j: Json, key: string, fallback: string) -> string {
+    match (json.get_string(j, key)) {
+        Option.Some(s) => s,
+        Option.None => fallback,
+    }
+}
+
+fn int_or(j: Json, key: string, fallback: int) -> int {
+    match (json.get_int(j, key)) {
+        Option.Some(n) => n,
+        Option.None => fallback,
+    }
+}
+
+/// The model ids in a `/v1/models` payload. Accepts the shapes real servers use: the
+/// OpenAI envelope (`{"data":[{"id":…}]}`), a bare array of objects or of strings, and a
+/// `{"models":[…]}` wrapper. Returns an empty list for anything else — a catalogue is a
+/// nicety, never a reason to fail.
+pub fn parse_model_list(body: string) -> [string] {
+    var ids: [string] = [];
+    match (json.parse(body)) {
+        Result.Err(_) => ids,
+        Result.Ok(root) => {
+            let none: [Json] = [];
+            var entries = match (json.get_array(root, "data")) {
+                Option.Some(a) => a,
+                Option.None => match (json.get_array(root, "models")) {
+                    Option.Some(a) => a,
+                    Option.None => match (json.as_array(root)) {
+                        Option.Some(a) => a,
+                        Option.None => none,
+                    },
+                },
+            };
+            for entry in entries {
+                match (json.as_string(entry)) {
+                    Option.Some(name) => ids.push(name),
+                    Option.None => {
+                        let id = string_or(entry, "id", string_or(entry, "name", ""));
+                        if (id != "") {
+                            ids.push(id);
+                        }
+                    },
+                }
+            }
+            ids.sort()
+        },
+    }
+}
+
+/// The models the endpoint offers, or an empty list when it exposes no catalogue.
+pub fn list_models(c: Config) -> [string] {
+    let root = root_url(c);
+    // `/v1/models` es la ruta estándar; algunos servidores la sirven sin el prefijo.
+    for url in [root + "/v1/models", root + "/models"] {
+        match (get_text(c, url)) {
+            Option.Some(body) => {
+                let ids = parse_model_list(body);
+                if (ids.len() > 0) {
+                    return ids;
+                }
+            },
+            Option.None => { },
+        }
+    }
+    []
+}
+
+// GET con las cabeceras del perfil; None ante cualquier fallo (el sondeo es opcional).
+fn get_text(c: Config, url: string) -> Option<string> {
+    match (http.request_bytes("GET", url, b"", headers_of(c), 5000)) {
+        Result.Err(_) => Option.None,
+        Result.Ok(r) => {
+            if (r.status < 200 || r.status >= 300) {
+                return Option.None;
+            }
+            match (http.body_text(r)) {
+                Result.Err(_) => Option.None,
+                Result.Ok(t) => Option.Some(t),
+            }
+        },
+    }
+}
+
+fn get_json(c: Config, url: string) -> Option<Json> {
+    match (get_text(c, url)) {
+        Option.None => Option.None,
+        Option.Some(t) => match (json.parse(t)) {
+            Result.Err(_) => Option.None,
+            Result.Ok(j) => Option.Some(j),
+        },
+    }
+}
+
+// llama.cpp: `/props` describe el modelo cargado y su ventana de contexto.
+fn probe_llama(c: Config) -> Option<ModelInfo> {
+    match (get_json(c, root_url(c) + "/props")) {
+        Option.None => Option.None,
+        Option.Some(j) => {
+            var name = string_or(j, "model_path", string_or(j, "model", ""));
+            // El nombre suele venir como ruta absoluta del GGUF: basta el archivo.
+            let parts = name.split("/");
+            if (parts.len() > 0) {
+                name = parts[parts.len() - 1];
+            }
+            var context = int_or(j, "n_ctx", 0);
+            if (context == 0) {
+                match (json.member(j, "default_generation_settings")) {
+                    Option.Some(g) => {
+                        context = int_or(g, "n_ctx", 0);
+                    },
+                    Option.None => { },
+                }
+            }
+            let slots = int_or(j, "total_slots", 0);
+            let detail = if (slots > 0) { "llama.cpp · ${slots} slot(s)" } else { "llama.cpp" };
+            if (name == "" && context == 0) {
+                Option.None
+            } else {
+                Option.Some(ModelInfo { name: name, context: context, detail: detail })
+            }
+        },
+    }
+}
+
+// OpenAI: `/v1/models/{id}` confirma que el modelo existe y quién lo sirve.
+fn probe_openai(c: Config) -> Option<ModelInfo> {
+    match (get_json(c, root_url(c) + "/v1/models/" + c.model)) {
+        Option.None => {
+            // Sin ruta por modelo (llama.cpp, opencode y compañía): vale el catálogo.
+            let catalogue = list_models(c);
+            if (catalogue.contains(c.model)) {
+                Option.Some(
+                    ModelInfo { name: c.model, context: 0, detail: "listed by the endpoint" }
+                )
+            } else {
+                Option.None
+            }
+        },
+        Option.Some(j) => {
+            let name = string_or(j, "id", c.model);
+            let owner = string_or(j, "owned_by", "");
+            Option.Some(
+                ModelInfo { name: name, context: int_or(j, "context_window", 0), detail: owner }
+            )
+        },
+    }
+}
+
+// Anthropic: `/v1/models/{id}` da el nombre visible y la ventana de entrada.
+fn probe_anthropic(c: Config) -> Option<ModelInfo> {
+    match (get_json(
+    c,
+    root_url(c) + "/v1/models/" + c.model
+)) {
+        Option.None => Option.None,
+        Option.Some(j) => Option.Some(
+            ModelInfo {
+                name: string_or(j, "display_name", c.model),
+                context: int_or(j, "max_input_tokens", 0),
+                detail: string_or(j, "id", "")
+            }
+        ),
+    }
+}
+
+/// Asks the endpoint what it is serving. Best effort: `None` when the endpoint does not
+/// answer, does not expose the route, or replies with something unexpected.
+pub fn probe(c: Config) -> Option<ModelInfo> {
+    match (c.api) {
+        Api.Anthropic => probe_anthropic(c),
+        Api.OpenAI => match (probe_llama(c)) {
+            Option.Some(i) => Option.Some(i),
+            Option.None => probe_openai(c),
+        },
+    }
+}

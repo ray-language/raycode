@@ -1,0 +1,203 @@
+// Configuración del harness: perfil de proveedor (llama.cpp local, OpenAI o Anthropic),
+// credenciales y parámetros de muestreo. Todo se puede fijar por entorno y sobreescribir
+// por bandera de línea de órdenes.
+
+/// The wire protocol spoken to the endpoint.
+pub enum Api {
+    Anthropic,
+    OpenAI,
+}
+
+/// Everything the harness needs to talk to one model.
+pub struct Config {
+    api: Api,
+    profile: string,
+    base_url: string,
+    api_key: string,
+    model: string,
+    system: string,
+    max_tokens: int,
+    temperature: float,
+    timeout_ms: int,
+    max_steps: int,
+    allow_exec: bool,
+    stream: bool,
+    verbose: bool,
+    prompt: string,
+}
+
+/// The protocol name, for the banner.
+pub fn api_name(a: Api) -> string {
+    match (a) {
+        Api.Anthropic => "anthropic",
+        Api.OpenAI => "openai-compatible",
+    }
+}
+
+// El valor de una variable de entorno, o `fallback` si no está o está vacía.
+fn env_or(name: string, fallback: string) -> string {
+    match (env(name)) {
+        Option.Some(v) => if (v.trim() == "") { fallback } else { v },
+        Option.None => fallback,
+    }
+}
+
+const DEFAULT_SYSTEM: string = "You are raycode, a concise coding assistant running in a terminal harness. Use the available tools to inspect and edit the workspace before answering. Keep answers short and concrete.";
+
+// Perfil base: define protocolo, endpoint, clave y modelo por defecto. Las banderas
+// posteriores lo afinan.
+fn preset(profile: string) -> Result<Config, string> {
+    let common_max = match (parse_int(env_or("RAYCODE_MAX_TOKENS", "4096"))) {
+        Option.Some(n) => n,
+        Option.None => 4096,
+    };
+    let common_timeout = match (parse_int(env_or("RAYCODE_TIMEOUT_MS", "600000"))) {
+        Option.Some(n) => n,
+        Option.None => 600000,
+    };
+    let common_steps = match (parse_int(env_or("RAYCODE_MAX_STEPS", "12"))) {
+        Option.Some(n) => n,
+        Option.None => 12,
+    };
+    let temperature = match (parse_float(env_or("RAYCODE_TEMPERATURE", "0.2"))) {
+        Option.Some(t) => t,
+        Option.None => 0.2,
+    };
+    let base = Config {
+        api: Api.OpenAI,
+        profile: profile,
+        base_url: "",
+        api_key: "",
+        model: "",
+        system: env_or("RAYCODE_SYSTEM", DEFAULT_SYSTEM),
+        max_tokens: common_max,
+        temperature: temperature,
+        timeout_ms: common_timeout,
+        max_steps: common_steps,
+        allow_exec: false,
+        stream: env_or("RAYCODE_STREAM", "on") != "off",
+        verbose: false,
+        prompt: ""
+    };
+    if (profile == "llama" || profile == "local") {
+        base.api = Api.OpenAI;
+        base.base_url = env_or("RAYCODE_BASE_URL", "http://127.0.0.1:8080");
+        base.api_key = env_or("RAYCODE_API_KEY", "");
+        base.model = env_or("RAYCODE_MODEL", "local-model");
+        Result.Ok(base)
+    } else if (profile == "openai") {
+        base.api = Api.OpenAI;
+        base.base_url = env_or("RAYCODE_BASE_URL", "https://api.openai.com");
+        base.api_key = env_or("OPENAI_API_KEY", env_or("RAYCODE_API_KEY", ""));
+        base.model = env_or("RAYCODE_MODEL", "gpt-4o-mini");
+        Result.Ok(base)
+    } else if (profile == "anthropic" || profile == "claude") {
+        base.api = Api.Anthropic;
+        base.base_url = env_or("RAYCODE_BASE_URL", "https://api.anthropic.com");
+        base.api_key = env_or("ANTHROPIC_API_KEY", env_or("RAYCODE_API_KEY", ""));
+        base.model = env_or("RAYCODE_MODEL", "claude-opus-5");
+        Result.Ok(base)
+    } else {
+        Result.Err("unknown profile '${profile}' (use: llama, openai, anthropic)")
+    }
+}
+
+// Bandera con valor: devuelve el argumento siguiente o un Err con el nombre de la bandera.
+fn value_of(argv: [string], i: int, flag: string) -> Result<string, string> {
+    if (i + 1 < argv.len()) {
+        Result.Ok(argv[i + 1])
+    } else {
+        Result.Err("missing value after ${flag}")
+    }
+}
+
+/// Builds the configuration from the environment and then applies the command-line flags.
+/// `RAYCODE_PROFILE` (or `--provider`) picks the preset; every other field has a flag.
+pub fn load(argv: [string]) -> Result<Config, string> {
+    // El perfil se resuelve primero: fija los valores por defecto que las banderas afinan.
+    var profile = env_or("RAYCODE_PROFILE", "llama");
+    var i = 0;
+    while (i < argv.len()) {
+        let a = argv[i];
+        if (a == "--provider" || a == "-p") {
+            profile = value_of(argv, i, a)?;
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+    var cfg = preset(profile)?;
+    var positional: [string] = [];
+    i = 0;
+    while (i < argv.len()) {
+        let a = argv[i];
+        if (a == "--provider" || a == "-p") {
+            i = i + 2;
+        } else if (a == "--base-url" || a == "-u") {
+            cfg.base_url = value_of(argv, i, a)?;
+            i = i + 2;
+        } else if (a == "--model" || a == "-m") {
+            cfg.model = value_of(argv, i, a)?;
+            i = i + 2;
+        } else if (a == "--api-key" || a == "-k") {
+            cfg.api_key = value_of(argv, i, a)?;
+            i = i + 2;
+        } else if (a == "--system" || a == "-s") {
+            cfg.system = value_of(argv, i, a)?;
+            i = i + 2;
+        } else if (a == "--max-tokens") {
+            let v = value_of(argv, i, a)?;
+            cfg.max_tokens = parse_int(v).unwrap_or(cfg.max_tokens);
+            i = i + 2;
+        } else if (a == "--temperature" || a == "-t") {
+            let v = value_of(argv, i, a)?;
+            cfg.temperature = parse_float(v).unwrap_or(cfg.temperature);
+            i = i + 2;
+        } else if (a == "--timeout-ms") {
+            let v = value_of(argv, i, a)?;
+            cfg.timeout_ms = parse_int(v).unwrap_or(cfg.timeout_ms);
+            i = i + 2;
+        } else if (a == "--max-steps") {
+            let v = value_of(argv, i, a)?;
+            cfg.max_steps = parse_int(v).unwrap_or(cfg.max_steps);
+            i = i + 2;
+        } else if (a == "--no-stream") {
+            cfg.stream = false;
+            i = i + 1;
+        } else if (a == "--allow-exec") {
+            cfg.allow_exec = true;
+            i = i + 1;
+        } else if (a == "--verbose" || a == "-v") {
+            cfg.verbose = true;
+            i = i + 1;
+        } else if (a.starts_with("-")) {
+            return Result.Err("unknown flag '${a}'");
+        } else {
+            positional.push(a);
+            i = i + 1;
+        }
+    }
+    // Los argumentos sueltos son una petición de un solo turno (modo no interactivo).
+    cfg.prompt = positional.join(" ");
+    if (cfg.model.trim() == "") {
+        return Result.Err("no model: pass --model or set RAYCODE_MODEL");
+    }
+    Result.Ok(cfg)
+}
+
+/// The endpoint URL for a chat completion, derived from the base URL and the protocol.
+pub fn chat_url(c: Config) -> string {
+    var base = c.base_url;
+    while (base.ends_with("/")) {
+        base = base.substring(0, base.len() - 1);
+    }
+    // Si el usuario ya apuntó a la ruta completa, se respeta tal cual.
+    if (base.contains("/chat/completions") || base.contains("/v1/messages")) {
+        return base;
+    }
+    match (c.api) {
+        Api.Anthropic => base + "/v1/messages",
+        Api.OpenAI => if (base.ends_with(
+            "/v1"
+        )) { base + "/chat/completions" } else { base + "/v1/chat/completions" },
+    }
+}
