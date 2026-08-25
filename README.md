@@ -32,7 +32,7 @@ tools    read_file, write_file, list_dir
 Una orden, sin dependencias, sin toolchain:
 
 ```sh
-curl -sSfL https://raw.githubusercontent.com/roberto-ayala/raycode/main/install.sh | sh
+curl -sSfL https://raw.githubusercontent.com/ray-language/raycode/main/install.sh | sh
 ```
 
 Detecta la plataforma, se trae el binario de la última GitHub Release, comprueba su
@@ -54,7 +54,7 @@ editor de línea entra al terminal a través de `std/term`/`std/io`, que son Uni
 
 ### Desde el código
 
-Con el toolchain de [raylang](https://github.com/roberto-ayala/raylang) instalado y el
+Con el toolchain de [raylang](https://github.com/ray-language/raylang) instalado y el
 paquete `net` en su sitio (`../../raylang/packages/net`, como declara `ray.toml`):
 
 ```sh
@@ -298,7 +298,7 @@ Como el toolchain de raylang aún no se publica como binario y el paquete `net` 
 ese repositorio (privado), el workflow lo clona al lado —`ray-apps/raycode` junto a
 `raylang`, la misma disposición que en local— y construye `ray` desde el fuente,
 cacheado por revisión. Hace falta un secreto **`RAYLANG_TOKEN`** en el repositorio de
-raycode: un PAT con permiso de lectura sobre `roberto-ayala/raylang`.
+raycode: un PAT con permiso de lectura sobre `ray-language/raylang`.
 
 `workflow_dispatch` ejecuta lo mismo sin tocar ninguna Release: compila, prueba y deja
 los binarios como artefactos de la ejecución. Sirve para estrenar el pipeline antes de

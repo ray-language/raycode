@@ -2,16 +2,16 @@
 # raycode installer. Downloads the prebuilt binary for this platform from the GitHub
 # Release and installs it into a directory on your PATH.
 #
-#   curl -sSfL https://raw.githubusercontent.com/roberto-ayala/raycode/main/install.sh | sh
+#   curl -sSfL https://raw.githubusercontent.com/ray-language/raycode/main/install.sh | sh
 #
 # Environment variables (all optional):
 #   RAYCODE_VERSION   tag to install (e.g. v0.1.0). Default: the latest release.
 #   RAYCODE_BIN_DIR   install directory. Default: $HOME/.local/bin
-#   RAYCODE_REPO      owner/repo. Default: roberto-ayala/raycode
+#   RAYCODE_REPO      owner/repo. Default: ray-language/raycode
 #   RAYCODE_DRY_RUN   if set, print the plan and download nothing (to test detection).
 set -eu
 
-REPO="${RAYCODE_REPO:-roberto-ayala/raycode}"
+REPO="${RAYCODE_REPO:-ray-language/raycode}"
 BIN_DIR="${RAYCODE_BIN_DIR:-$HOME/.local/bin}"
 
 info() { printf '\033[1;34m→\033[0m %s\n' "$1"; }
