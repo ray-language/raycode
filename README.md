@@ -50,7 +50,7 @@ RAYCODE_VERSION=v0.1.0 RAYCODE_BIN_DIR=/usr/local/bin ./install.sh
 ```
 
 Se publica para **Linux** y **macOS**, en x86-64 y arm64. En Windows va por WSL: el
-editor de línea entra al terminal por FFI a la libc (`termios`, `poll`), que es Unix.
+editor de línea entra al terminal a través de `std/term`/`std/io`, que son Unix por debajo.
 
 ### Desde el código
 
@@ -113,7 +113,7 @@ desde el que se invoca, que es lo que se quiere de un agente: `read_file`,
   bloques (y si el endpoint ignora el streaming y contesta un JSON normal, se lee como
   respuesta suelta en vez de quedarse en blanco): en cuanto un bloque cierra (una línea en blanco fuera de una cerca) ya es
   un documento completo y se renderiza. El indicador de actividad dura hasta el
-  primer token. Se apaga con `--no-stream` o `/set stream off`.
+  primer token. Se apaga al arrancar con `--no-stream` (o `RAYCODE_STREAM=off`).
 - **Markdown en la respuesta.** El AST viene de `std/markdown` y aquí se pinta:
   negritas, cursivas, `código`, títulos, listas (anidadas y ordenadas), citas,
   reglas, enlaces, imágenes, **tablas GFM con su alineación** y bloques cercados
@@ -155,7 +155,8 @@ desde el que se invoca, que es lo que se quiere de un agente: `read_file`,
 
 El REPL trae su propio editor de línea (`src/lineedit.ray`), porque `input()` solo lee
 líneas enteras y nunca ve un Tab ni una flecha. El modo crudo del terminal y la lectura
-byte a byte salen por FFI a la libc (`tcgetattr`/`cfmakeraw`/`tcsetattr`/`getchar`).
+byte a byte con plazo salen de `std/term` y `std/io` (`term.raw`, `term.decode`,
+`io.read_timeout`), que envuelven la libc por debajo.
 
 | Tecla | Qué hace |
 |---|---|
@@ -173,9 +174,8 @@ editor se despierta cada 250 ms, y si el ancho cambió repinta al nuevo. No hace
 
 La línea puede ser más ancha que el terminal: el repintado sube al principio del
 bloque, borra de ahí hacia abajo y lo pinta entero, así que editar en medio de una
-línea envuelta coloca el cursor donde toca. El ancho sale de `COLUMNS`, y si no de
-`stty size` sobre `/dev/tty` (leer los atributos del terminal desde un hijo es
-seguro; escribirlos es lo que dispara `SIGTTOU`), con 80 como último recurso.
+línea envuelta coloca el cursor donde toca. El ancho se pregunta a `term.size()`
+(`std/term`), con 80 como último recurso cuando no hay terminal que responda.
 
 Con Tab, un único candidato se inserta entero (los directorios acaban en `/` para poder
 seguir bajando); varios candidatos insertan el prefijo común y, si no hay nada que
@@ -183,8 +183,8 @@ insertar, se listan. Una barra en primera posición que no case ninguna orden se
 como ruta absoluta, así que `/tm`+Tab da `/tmp/`.
 
 Sin terminal —una tubería, `ray test`, stdin redirigido— el editor se apaga solo y se
-vuelve a `input()`: el harness sigue siendo guionizable. El FFI es Unix; en otras
-plataformas cae al mismo camino. Si el proceso muere de forma anómala mientras editas
+vuelve a `input()`: el harness sigue siendo guionizable. `std/term` es Unix por debajo;
+en otras plataformas se cae al mismo camino. Si el proceso muere de forma anómala mientras editas
 (un `kill` externo), el terminal puede quedar en modo crudo: `reset` lo devuelve a su
 sitio.
 
@@ -206,7 +206,7 @@ herramienta en marcha. El turno acaba ahí y vuelve el prompt.
 
 Para que la tecla llegue en el momento, el terminal se pone en modo crudo durante
 todo el turno —si no, `ESC` se quedaría en el búfer de línea hasta el siguiente
-Enter— y una fibra la vigila con `poll(2)` mientras otra hace el trabajo. Lo que se
+Enter— y una fibra la sondea con `io.read_timeout` mientras otra hace el trabajo. Lo que se
 abandona sigue vivo hasta que termine solo: una petición HTTP en vuelo se descarta al
 llegar, y un mandato de shell sigue corriendo hasta su propio `timeout_ms`.
 
@@ -227,23 +227,24 @@ escritura por adelantado.
 | `/model` | el modelo en uso y el catálogo del endpoint (`GET /v1/models`), con el actual marcado |
 | `/model <id>` | cambia de modelo en caliente, conservando la conversación |
 | `/tools` | las herramientas expuestas al modelo |
-| `/set [clave valor]` | mandos en caliente: `max-tokens`, `temperature`, `max-steps`, `timeout-ms`, `stream` (sin argumentos, los muestra) |
+| `/set [clave valor]` | mandos en caliente: `max-tokens`, `temperature`, `max-steps`, `timeout-ms` (sin argumentos, los muestra junto a `stream`) |
 | `/system <texto>` | reemplaza el prompt de sistema (vacío: lo muestra) |
 | `/reset` | olvida la conversación, conserva los totales |
 | `/verbose` | traza peticiones y respuestas en stderr |
-| `/exit` | salir (igual que Ctrl-D) |
+| `/exit` (o `/quit`) | salir (igual que Ctrl-D) |
 | `ESC` | detiene el turno en marcha (el modelo o su herramienta) |
 
 ## Configuración
 
 Banderas: `-p/--provider`, `-u/--base-url`, `-m/--model`, `-k/--api-key`,
 `-s/--system`, `--max-tokens`, `-t/--temperature`, `--timeout-ms`, `--max-steps`,
-`--allow-exec`, `-v/--verbose`. Lo que sobre en la línea de órdenes es la petición
-de un solo turno.
+`--no-stream`, `--allow-exec`, `-v/--verbose`. Lo que sobre en la línea de órdenes es
+la petición de un solo turno.
 
 Entorno: `RAYCODE_PROFILE`, `RAYCODE_BASE_URL`, `RAYCODE_MODEL`, `RAYCODE_API_KEY`,
 `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `RAYCODE_SYSTEM`, `RAYCODE_MAX_TOKENS`,
-`RAYCODE_TEMPERATURE`, `RAYCODE_MAX_STEPS`, `RAYCODE_TIMEOUT_MS`, `NO_COLOR`.
+`RAYCODE_TEMPERATURE`, `RAYCODE_MAX_STEPS`, `RAYCODE_TIMEOUT_MS`, `RAYCODE_STREAM`,
+`NO_COLOR` (o `RAYCODE_NO_COLOR`).
 
 ## Estructura
 
@@ -268,8 +269,12 @@ Entorno: `RAYCODE_PROFILE`, `RAYCODE_BASE_URL`, `RAYCODE_MODEL`, `RAYCODE_API_KE
 | `install.sh` | instalador del binario desde la GitHub Release |
 | `.github/workflows/release.yml` | compila y publica los binarios al empujar un tag `v*` |
 
-Dependencia única: el paquete `net` de raylang (para `net/http`), declarado por ruta
-en `ray.toml`.
+Dependencia externa única: el paquete `net` de raylang (para `net/http`), declarado
+por ruta en `ray.toml`. Todo lo demás sale de la **biblioteca estándar de raylang**, no
+de código propio ni de terceros: `std/markdown` parsea la respuesta del modelo (aquí
+solo se pinta el AST), `std/term` da el modo crudo, la decodificación de teclas y el
+tamaño de la ventana, `std/io` la lectura con plazo, y `std/json`, `std/process`,
+`std/fs`, `std/time` y `std/math` completan el resto.
 
 ## Publicar una versión
 
