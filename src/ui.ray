@@ -10,12 +10,9 @@ const DEFAULT_WIDTH: int = 80;
 
 const MIN_WIDTH: int = 20;
 
-// El escape ANSI no cabe en un literal (no hay \u): se construye por code point.
+// Desde raylang M118 los literales de string admiten escapes \u: el prefijo ESC es un literal.
 fn esc() -> string {
-    match (char_from_code(27)) {
-        Option.Some(c) => to_string(c),
-        Option.None => "",
-    }
+    "\u{1B}"
 }
 
 /// True unless the environment asks for plain output (`NO_COLOR` or `RAYCODE_NO_COLOR`).
