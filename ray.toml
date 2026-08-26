@@ -4,4 +4,4 @@ version = "0.1.0"
 entry = "main.ray"
 
 [dependencies]
-net = "path:../../raylang/packages/net"
+net = "git+https://github.com/ray-language/net@v0.1.0"
