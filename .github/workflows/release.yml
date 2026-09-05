@@ -1,17 +1,15 @@
 # raycode RELEASE pipeline. Pushing a `vX.Y.Z` tag builds the native binary for every
 # supported platform and uploads it to that tag's GitHub Release.
 #
-# Two things make this workflow longer than a plain `cargo build`:
+# The raylang toolchain is installed from its own GitHub Release (the same `install.sh`
+# a user runs), pinned to RAYLANG_VERSION so a release of raycode is reproducible. The
+# `net` package is a git dependency of ray.toml and `ray fetch` brings it in. The
+# native build needs a Rust toolchain: the GitHub runners ship rustup + stable.
 #
-#   * The raylang toolchain is not published as a binary yet, so `ray` is built from
-#     source out of the (private) raylang repository — which also provides the `net`
-#     package that `ray.toml` depends on by path (`../../raylang/packages/net`). Both
-#     checkouts therefore have to keep their relative layout: `ray-apps/raycode` next
-#     to `raylang`, exactly as on a developer machine.
-#   * Every platform compiles NATIVELY on its own runner. `ray build --release` adds
-#     `-C target-cpu=native` unless `--target` is given, which would produce binaries
-#     that fault on older CPUs; passing the runner's own triple keeps the release
-#     profile (opt3 + fat LTO + codegen-units=1) while staying portable.
+# Every platform compiles NATIVELY on its own runner. `ray build --release` adds
+# `-C target-cpu=native` unless `--target` is given, which would produce binaries that
+# fault on older CPUs; passing the runner's own triple keeps the release profile
+# (opt3 + fat LTO + codegen-units=1) while staying portable.
 #
 # Assets carry no version in their name (`raycode-<target>.tar.gz`), so install.sh can
 # fetch `releases/latest/download/...` without going through the GitHub API.
@@ -29,10 +27,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Repository holding the raylang toolchain and the `net` package. Private, so the
-  # checkout needs a PAT with read access in the RAYLANG_TOKEN secret.
-  RAYLANG_REPO: roberto-ayala/raylang
-  RAYLANG_REF: main
+  # The raylang toolchain release to build with (https://github.com/ray-language/raylang/releases).
+  RAYLANG_VERSION: v1.6.4
 
 jobs:
   # Create (or reuse, if it already exists) the tag's Release, with generated notes.
@@ -81,73 +77,54 @@ jobs:
           - { os: macos-14,         target: aarch64-apple-darwin }
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Check out raycode
-        uses: actions/checkout@v4
-        with:
-          path: ray-apps/raycode
+      - uses: actions/checkout@v4
 
-      # The path dependency in ray.toml points at ../../raylang/packages/net, so the
-      # sibling layout of the workspace has to be reproduced here.
-      - name: Check out raylang (toolchain + net package)
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.RAYLANG_REPO }}
-          ref: ${{ env.RAYLANG_REF }}
-          token: ${{ secrets.RAYLANG_TOKEN || github.token }}
-          path: raylang
+      - name: Install the raylang toolchain
+        shell: bash
+        run: |
+          curl -sSfL https://raylang.dev/install.sh | RAYLANG_VERSION="$RAYLANG_VERSION" sh
+          echo "$HOME/.local/bin" >>"$GITHUB_PATH"
 
-      - name: Install Rust stable + target
+      - name: Rust stable (the native build compiles ray-runtime)
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
           rustup target add ${{ matrix.target }}
 
-      - name: Resolve the raylang revision
-        id: raylang
-        shell: bash
-        working-directory: raylang
-        run: echo "sha=$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
-
-      # The toolchain build dominates the run; key the cache on the exact raylang
-      # revision so it only rebuilds when raylang actually moves.
-      - name: Cache the raylang toolchain build
+      # ray-runtime is built from crates on the first native build; keep the crate
+      # downloads and the build across runs of the same toolchain version.
+      - name: Cache the native build
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            raylang/target
-          key: ray-toolchain-${{ matrix.target }}-${{ steps.raylang.outputs.sha }}
-          restore-keys: ray-toolchain-${{ matrix.target }}-
-
-      - name: Build the ray toolchain
-        shell: bash
-        working-directory: raylang
-        run: |
-          cargo build --release --bin ray
-          echo "$PWD/target/release" >>"$GITHUB_PATH"
+            ~/.ray
+          key: ray-native-${{ matrix.target }}-${{ env.RAYLANG_VERSION }}
+          restore-keys: ray-native-${{ matrix.target }}-
 
       - name: ray version
-        run: ray version
+        run: ray --version
+
+      - name: Fetch the dependencies (ray.lock)
+        run: ray fetch
 
       - name: Run the test suite
-        working-directory: ray-apps/raycode
         run: ray test
 
       # `--target` is the runner's own triple: a native build, but without the
       # `target-cpu=native` that `--release` alone would bake in.
       - name: Build the native binary
         shell: bash
-        working-directory: ray-apps/raycode
         run: |
           mkdir -p dist
           ray build --native main.ray -o dist/raycode --release --target ${{ matrix.target }}
           ls -la dist/raycode
+          dist/raycode --help | head -3
 
       - name: Package (tar.gz + sha256)
         id: package
         shell: bash
-        working-directory: ray-apps/raycode
         run: |
           asset="raycode-${{ matrix.target }}.tar.gz"
           tar czf "$asset" -C dist raycode
@@ -165,15 +142,14 @@ jobs:
         with:
           name: raycode-${{ matrix.target }}
           path: |
-            ray-apps/raycode/${{ steps.package.outputs.asset }}
-            ray-apps/raycode/${{ steps.package.outputs.asset }}.sha256
+            ${{ steps.package.outputs.asset }}
+            ${{ steps.package.outputs.asset }}.sha256
 
       - name: Upload the asset to the Release
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
-        working-directory: ray-apps/raycode
         run: |
           gh release upload "$GITHUB_REF_NAME" \
             "${{ steps.package.outputs.asset }}" \

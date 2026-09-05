@@ -54,10 +54,11 @@ editor de línea entra al terminal a través de `std/term`/`std/io`, que son Uni
 
 ### Desde el código
 
-Con el toolchain de [raylang](https://github.com/ray-language/raylang) instalado y el
-paquete `net` en su sitio (`../../raylang/packages/net`, como declara `ray.toml`):
+Con el toolchain de [raylang](https://github.com/ray-language/raylang) instalado
+(`curl -sSfL https://raylang.dev/install.sh | sh`) y Rust en el PATH para el build nativo:
 
 ```sh
+ray fetch                                              # el paquete `net`, según ray.lock
 ray build --native main.ray -o bin/raycode --release   # binario de código máquina
 ln -sf "$PWD/bin/raycode" ~/.local/bin/raycode         # una vez
 ```
@@ -389,11 +390,10 @@ propio runner y con `--target` explícito: así se queda el perfil de release
 CPU del runner. Los assets no llevan la versión en el nombre, de modo que `install.sh`
 puede pedir `releases/latest/download/…` sin pasar por la API de GitHub.
 
-Como el toolchain de raylang aún no se publica como binario y el paquete `net` vive en
-ese repositorio (privado), el workflow lo clona al lado —`ray-apps/raycode` junto a
-`raylang`, la misma disposición que en local— y construye `ray` desde el fuente,
-cacheado por revisión. Hace falta un secreto **`RAYLANG_TOKEN`** en el repositorio de
-raycode: un PAT con permiso de lectura sobre `ray-language/raylang`.
+El toolchain de raylang se instala en cada runner desde su propia Release con el mismo
+`install.sh` que usa un desarrollador, fijado a la versión `RAYLANG_VERSION` del workflow
+para que una release de raycode sea reproducible; `ray fetch` trae el paquete `net` según
+`ray.lock`. No hace falta ningún secreto.
 
 `workflow_dispatch` ejecuta lo mismo sin tocar ninguna Release: compila, prueba y deja
 los binarios como artefactos de la ejecución. Sirve para estrenar el pipeline antes de
