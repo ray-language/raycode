@@ -117,11 +117,13 @@ y la sesión sigue con el resto. `/mcp reload` reintenta sin perder la conversac
 
 ## Estado
 
-Fases 1 y 2 hechas (`src/mcp.ray`, `Tool.source`, `Session.mcp`, `.raycode/mcp.json`,
-banner, `/mcp`, `/mcp reload`, origen en `/tools`, tope de 60 KiB, plazos, errores
-legibles). Novedad respecto a la medición de arriba: raylang 1.6.2 ya trae
-`Cmd.stdin_pipe()` + `Proc.write` / `Proc.close_stdin`, así que la fase 4a (sesión
-persistente) ha dejado de estar bloqueada por el runtime.
+Fases 1, 2 y 4a hechas. El transporte ya NO es un proceso por llamada: raylang 1.1.0
+trajo `Cmd.stdin_pipe()` + `Proc.write` / `Proc.close_stdin` (la "v3" que el runtime
+anticipaba), y `src/mcp.ray` sostiene una sesión por servidor en un actor —una fibra que
+posee el proceso y atiende peticiones por canal—, con relanzamiento tras muerte o plazo
+vencido y cierre ordenado al salir. El tope de 60 KiB desapareció con él: `Proc.write`
+aparca la fibra con contrapresión en vez de clavar la VM. Las `instructions` del
+`initialize` van al prompt de sistema. Queda la fase 3 (recursos) y 4b (HTTP/SSE).
 
 ## Fases
 

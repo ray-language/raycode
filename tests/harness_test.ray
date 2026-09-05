@@ -686,20 +686,22 @@ fn mcp_config_follows_the_standard_envelope() {
 }
 
 @test
-fn mcp_batch_carries_the_handshake_and_the_request() {
-    let params = match (json.parse(`{"name":"ray_fmt","arguments":{"code":"fn main() {}"}}`)) {
-        Result.Ok(j) => j,
-        Result.Err(e) => panic(e),
-    };
-    let lines = mcp.batch("tools/call", params).trim().split("\n");
-    assert_eq(lines.len(), 3);
+fn mcp_handshake_and_requests_are_json_lines() {
+    let lines = mcp.handshake().trim().split("\n");
+    assert_eq(lines.len(), 2);
     assert(lines[0].contains("\"method\":\"initialize\""));
     assert(lines[0].contains("\"id\":1"));
     assert(lines[0].contains(mcp.PROTOCOL_VERSION));
     assert(lines[1].contains("notifications/initialized"));
     assert(!lines[1].contains("\"id\""));
-    assert(lines[2].contains("\"id\":2"));
-    assert(lines[2].contains("\"name\":\"ray_fmt\""));
+    let params = match (json.parse(`{"name":"ray_fmt","arguments":{"code":"fn main() {}"}}`)) {
+        Result.Ok(j) => j,
+        Result.Err(e) => panic(e),
+    };
+    let line = mcp.request(7, "tools/call", params);
+    assert(!line.contains("\n"));
+    assert(line.contains("\"id\":7"));
+    assert(line.contains("\"name\":\"ray_fmt\""));
 }
 
 @test
@@ -762,26 +764,6 @@ fn mcp_tools_list_becomes_remote_tools() {
 }
 
 @test
-fn mcp_batches_over_the_pipe_limit_are_rejected_naming_the_argument() {
-    let big = "x".repeat(70000);
-    let params = match (json.parse(`{"name":"t","arguments":{"small":"1","code":"${big}"}}`)) {
-        Result.Ok(j) => j,
-        Result.Err(e) => panic(e),
-    };
-    let arguments = match (json.member(params, "arguments")) {
-        Option.Some(a) => a,
-        Option.None => panic("no arguments"),
-    };
-    match (mcp.check_size(mcp.batch("tools/call", params), arguments)) {
-        Result.Ok(_) => panic("expected a rejection"),
-        Result.Err(e) => {
-            assert(e.contains("over the"));
-            assert(e.contains("'code'"));
-        },
-    }
-}
-
-@test
 fn mcp_remote_tools_enter_the_catalogue_and_dispatch() {
     // De punta a punta contra `ray mcp`; se salta si el binario no está en el PATH.
     match (process.run("ray", ["--version"])) {
@@ -810,7 +792,11 @@ fn mcp_remote_tools_enter_the_catalogue_and_dispatch() {
     assert(config.system_prompt(c).contains("llms.txt"));
     let body = openai.build_body(c, catalogue, [message.user("hi")]);
     assert(body.contains("llms.txt"));
-    let anthropic_body = anthropic.build_body(base_config("anthropic"), catalogue, [message.user("hi")]);
+    let anthropic_body = anthropic.build_body(
+        base_config("anthropic"),
+        catalogue,
+        [message.user("hi")]
+    );
     assert(!anthropic_body.contains("llms.txt"));
     assert_eq(servers[0].tool_count, catalogue.len());
     assert(tools.offers(catalogue, "mcp__raylang__ray_check"));
@@ -845,4 +831,51 @@ fn mcp_a_server_that_cannot_start_is_marked_not_fatal() {
     assert(servers[0].note.contains("cannot start"));
     let answer = tools.execute(catalogue, servers, "mcp__ghost__x", "{}");
     assert(answer.contains("unknown tool"));
+    assert(!servers[0].running);
+}
+
+// Un servidor de mentira en sh: contesta initialize y tools/list con la id que le llega,
+// y se MUERE al primer tools/call. Sirve para probar el relanzamiento.
+fn flaky_server_script() -> string {
+    let path = "/tmp/raycode_flaky_mcp.sh";
+    let script = `while read line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\\([0-9]*\\).*/\\1/p')
+  case "$line" in
+    *initialize*) echo "{\\"jsonrpc\\":\\"2.0\\",\\"id\\":$id,\\"result\\":{\\"instructions\\":\\"be brief\\"}}" ;;
+    *tools/list*) echo "{\\"jsonrpc\\":\\"2.0\\",\\"id\\":$id,\\"result\\":{\\"tools\\":[{\\"name\\":\\"boom\\"}]}}" ;;
+    *tools/call*) exit 3 ;;
+  esac
+done
+`;
+    match (fs.write_file(path, script)) {
+        Result.Ok(_) => path,
+        Result.Err(e) => panic(e),
+    }
+}
+
+@test
+fn mcp_a_server_that_dies_mid_session_is_reported_and_relaunched() {
+    let path = flaky_server_script();
+    let servers = match (mcp.parse_config(
+        `{"mcpServers":{"flaky":{"command":"sh","args":["${path}"]}}}`
+    )) {
+        Result.Ok(s) => s,
+        Result.Err(e) => panic(e),
+    };
+    let catalogue = tools.from_servers(servers);
+    assert_eq(catalogue.len(), 1);
+    assert_eq(servers[0].instructions, "be brief");
+    // La llamada mata al servidor: el modelo recibe un error legible, no un cuelgue.
+    let first = tools.execute(catalogue, servers, "mcp__flaky__boom", "{}");
+    assert(first.contains("exited"));
+    assert(first.contains("exit 3"));
+    // Y la siguiente petición relanza el proceso: vuelve a contestar como nuevo.
+    match (mcp.ask(servers[0], "tools/list", match (json.parse("{}")) {
+        Result.Ok(j) => j,
+        Result.Err(e) => panic(e),
+    }, 3000)) {
+        Result.Ok(answer) => assert_eq(answer.instructions, "be brief"),
+        Result.Err(e) => panic(e),
+    }
+    mcp.shutdown(servers);
 }

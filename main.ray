@@ -344,6 +344,7 @@ fn repl(s: agent.Session, editor: lineedit.Editor) -> int {
             Option.None => {
                 print("");
                 show_usage(s);
+                agent.close(s);
                 return 0;
             },
             Option.Some(line) => {
@@ -352,6 +353,7 @@ fn repl(s: agent.Session, editor: lineedit.Editor) -> int {
                     if (text.starts_with("/")) {
                         if (!command(s, text)) {
                             show_usage(s);
+                            agent.close(s);
                             return 0;
                         }
                     } else {

@@ -75,8 +75,15 @@ pub fn open(c: Config) -> Result<Session, string> {
     Result.Ok(s)
 }
 
+/// Stops every MCP server. The harness calls it on the way out; a server left running
+/// would only see EOF on its stdin when the process dies.
+pub fn close(s: Session) {
+    mcp.shutdown(s.mcp);
+}
+
 /// Rebuilds the catalogue: the builtins plus a fresh discovery against every MCP server
-/// (a server that had failed gets another chance). The transcript is kept.
+/// (a server that had failed gets another chance; a healthy one is restarted). The
+/// transcript is kept.
 pub fn reconnect(s: Session) {
     for server in s.mcp {
         // Un servidor apagado por configuración sigue apagado; uno caído se reintenta.

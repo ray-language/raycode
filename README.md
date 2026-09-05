@@ -268,20 +268,23 @@ mcp      raylang · ray mcp · 5 tools
 programa arbitrario que se lanza en nombre del usuario, y por eso el banner dice cuál,
 con qué mandato y qué aportó. Un servidor que no arranca, que tarda más de 5 s o que
 contesta basura no tumba nada: se marca en rojo con la causa, la sesión sigue con el
-resto y `/mcp reload` lo reintenta sin perder la conversación.
+resto y `/mcp reload` reinicia todos los servidores sin perder la conversación.
 
-El transporte es **stdio, un proceso por llamada**: cada `tools/list` y cada `tools/call`
-lanza el servidor, le manda por stdin el apretón de manos (`initialize`, `initialized`)
-y la petición en un solo lote, drena su salida y se queda con la respuesta. Es lo que
-hace que el catálogo funcione con cualquier servidor stdio, con dos consecuencias que
-conviene saber: solo sirven servidores **sin estado entre llamadas** (`ray mcp` lo es,
-y cuesta unos 5 ms por llamada), y el coste de arranque se paga en cada uso (trivial
-para `ray mcp`, cerca de un segundo para un servidor de `npx`). Una petición de más de
-60 KiB se rechaza con un error que dice qué argumento se pasó de tamaño, antes de que
-la escritura síncrona al pipe pueda clavar la VM. Una llamada tiene 60 s; después se
-mata el proceso y el modelo recibe el error. Los resultados llegan al modelo como texto:
-los bloques `text` tal cual, los demás resumidos (`[image 12 KiB]`), y `isError` por el
-mismo camino que cualquier fallo de herramienta —error legible, nunca un panic.
+El transporte es **stdio, una sesión por servidor**: cada servidor se lanza una vez al
+abrir la sesión, con su stdin abierto (`stdin_pipe` de `std/process`), recibe el apretón
+de manos (`initialize`, `initialized`) y desde ahí cada `tools/call` es una línea JSON-RPC
+que espera su respuesta por `id`. El proceso lo posee una sola fibra —un actor por
+servidor— y el resto del harness le habla por canal, que es lo que permite que la llamada
+salga desde la fibra que atiende cada paso. Vale por tanto para servidores con estado, y
+el arranque se paga una vez: una llamada a `ray mcp` cuesta unos 20 ms. Una llamada tiene
+60 s; si el servidor no contesta se mata, el modelo recibe el error, y la siguiente
+petición lo relanza —lo mismo si muere por su cuenta. Al salir, raycode cierra el stdin
+de cada servidor y espera a que termine (a la fuerza tras 2 s). Las `instructions` que
+un servidor declara en `initialize` se añaden al prompt de sistema, etiquetadas con su
+nombre (`/system` muestra solo la parte del usuario; `/mcp` enseña las del servidor).
+Los resultados llegan al modelo como texto: los bloques `text` tal cual, los demás
+resumidos (`[image 12 KiB]`), e `isError` por el mismo camino que cualquier fallo de
+herramienta —error legible, nunca un panic.
 
 Con `ray mcp` el bucle es el de escribir raylang y verificarlo en el mismo turno:
 
@@ -325,7 +328,7 @@ Entorno: `RAYCODE_PROFILE`, `RAYCODE_BASE_URL`, `RAYCODE_MODEL`, `RAYCODE_API_KE
 | `src/anthropic.ray` | adaptador `/v1/messages` |
 | `src/client.ray` | transporte HTTP, cronometraje y sondeo del modelo |
 | `src/tools.ray` | catálogo de herramientas y su ejecución protegida |
-| `src/mcp.ray` | cliente MCP por stdio: configuración, apretón de manos, `tools/list` y `tools/call` |
+| `src/mcp.ray` | cliente MCP por stdio: configuración, un actor por servidor sobre `stdin_pipe`, `tools/list` y `tools/call` |
 | `src/agent.ray` | el bucle: pedir → ejecutar herramientas → repetir |
 | `src/usage.ray` | contabilidad de tokens, peticiones y latencia |
 | `src/ui.ray` | color ANSI y formateadores de terminal |

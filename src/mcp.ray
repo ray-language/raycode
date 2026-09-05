@@ -2,13 +2,13 @@
 // entran en el catálogo que raycode ofrece al modelo, junto a `read_file` y compañía,
 // sin que el bucle del agente distinga unas de otras.
 //
-// Transporte: UN PROCESO POR LLAMADA. Cada operación (`tools/list` al abrir la sesión,
-// `tools/call` en cada uso) lanza el servidor, le manda por stdin el apretón de manos y
-// la petición en un solo lote, drena su stdout hasta EOF y se queda con la línea cuya
-// `id` es la de la petición. Es lo que hace viable un catálogo sin sesión persistente:
-// vale para servidores sin estado entre llamadas (`ray mcp` lo es, ~5 ms por llamada),
-// y el coste de arranque se paga en cada uso. Una sesión larga sobre `stdin_pipe` es la
-// siguiente fase, no esta.
+// Transporte: UNA SESIÓN POR SERVIDOR. Cada servidor se lanza una vez, con su stdin abierto
+// (`stdin_pipe`), y vive lo que la sesión: el apretón de manos se hace al arrancar y cada
+// petición es una línea JSON-RPC que espera su respuesta por `id`. El proceso lo posee UNA
+// fibra —el actor— y el resto del harness le habla por canal: la sesión se copia a la
+// fibra que atiende cada paso, y un handle de proceso no puede copiarse, pero un canal sí
+// sigue apuntando al mismo actor desde cualquier copia. Un servidor que muere o se cuelga
+// se mata, se informa del error, y se relanza en la siguiente petición.
 import std/json;
 import std/process;
 import std/time;
@@ -17,8 +17,9 @@ import src/ui;
 from std/json import Json;
 
 /// One MCP server as configured, plus what discovery learned about it. `note` keeps
-/// the last error (empty when healthy), `tool_count` what the catalogue holds and
-/// `instructions` the system-prompt text the server declared in `initialize`.
+/// the last error (empty when healthy), `tool_count` what the catalogue holds,
+/// `instructions` the system-prompt text the server declared in `initialize`, and `link`
+/// the channel to the fiber that owns its process (`running` says whether it is up).
 pub struct Server {
     name: string,
     command: string,
@@ -28,6 +29,21 @@ pub struct Server {
     enabled: bool,
     note: string,
     tool_count: int,
+    instructions: string,
+    link: Channel<Request>,
+    running: bool,
+}
+
+/// What the harness sends to a server's actor: a request to forward, or the order to stop.
+pub enum Request {
+    Ask(string, Json, int, Channel<Result<Answer, string>>),
+    Stop(Channel<int>),
+}
+
+/// A server's reply: the `result` of the request, plus the instructions it declared when
+/// it was initialised.
+pub struct Answer {
+    result: Json,
     instructions: string,
 }
 
@@ -48,18 +64,11 @@ pub const DISCOVER_TIMEOUT_MS: int = 5000;
 /// How long one `tools/call` may take before the server process is killed.
 pub const CALL_TIMEOUT_MS: int = 60000;
 
-// Tope del lote que va por stdin. El `write_all` del runtime es síncrono: si el lote
-// pasa del búfer del pipe y el hijo no consume, clavaría el hilo de la VM entera. Se
-// rechaza antes, con un error que dice qué argumento se pasó.
-const MAX_BATCH: int = 61440;
-
-// Cuánto se guarda de stderr para el mensaje de error (solo la cola).
-const MAX_STDERR: int = 2048;
-
-// La `id` de la petición útil del lote: `initialize` lleva la 1.
-const REQUEST_ID: int = 2;
-
+// La `id` del `initialize`; las peticiones siguientes cuentan desde la 2.
 const HELLO_ID: int = 1;
+
+// Cuánto se espera a que un servidor termine por las buenas tras cerrarle stdin.
+const STOP_GRACE_MS: int = 2000;
 
 const NAME_PREFIX: string = "mcp__";
 
@@ -205,8 +214,9 @@ fn parse_server(name: string, spec: Json) -> Result<Server, string> {
         Option.Some(d) => d,
         Option.None => false,
     };
+    let link: Channel<Request> = Channel.new();
     Result.Ok(
-        Server { name: name, command: command, args: arguments, dir: dir, env: environment, enabled: !disabled, note: if (disabled) { "disabled in the configuration" } else { "" }, tool_count: 0, instructions: "" }
+        Server { name: name, command: command, args: arguments, dir: dir, env: environment, enabled: !disabled, note: if (disabled) { "disabled in the configuration" } else { "" }, tool_count: 0, instructions: "", link: link, running: false }
     )
 }
 
@@ -253,19 +263,9 @@ pub fn load(explicit: string) -> Result<[Server], string> {
 
 // ---------------------------------------------------------------- protocolo
 
-// Una petición JSON-RPC como línea.
-fn request(id: int, method: string, params: Json) -> string {
-    json.stringify(
-        obj(
-            ["jsonrpc", "id", "method", "params"],
-            [jstr("2.0"), Json.JNum(id as float), jstr(method), params]
-        )
-    )
-}
-
-/// The stdin batch for one operation: `initialize`, the `initialized` notification and
-/// the request itself (id 2), one JSON line each.
-pub fn batch(method: string, params: Json) -> string {
+/// The two lines that open a session: `initialize` (id 1) and the `initialized`
+/// notification.
+pub fn handshake() -> string {
     let hello = request(
         HELLO_ID,
         "initialize",
@@ -281,7 +281,17 @@ pub fn batch(method: string, params: Json) -> string {
     let ready = json.stringify(
         obj(["jsonrpc", "method"], [jstr("2.0"), jstr("notifications/initialized")])
     );
-    hello + "\n" + ready + "\n" + request(REQUEST_ID, method, params) + "\n"
+    hello + "\n" + ready + "\n"
+}
+
+/// One request line (no trailing newline).
+pub fn request(id: int, method: string, params: Json) -> string {
+    json.stringify(
+        obj(
+            ["jsonrpc", "id", "method", "params"],
+            [jstr("2.0"), Json.JNum(id as float), jstr(method), params]
+        )
+    )
 }
 
 /// The reply line whose `id` is `id`, out of everything the server wrote to stdout.
@@ -399,68 +409,129 @@ pub fn parse_tools(result: Json) -> Result<[RemoteTool], string> {
     Result.Ok(tools)
 }
 
-/// The batch size check: an Err naming the biggest argument when `params` would push the
-/// stdin batch over the limit the synchronous pipe write can take.
-pub fn check_size(text: string, arguments: Json) -> Result<int, string> {
-    if (text.len() <= MAX_BATCH) {
-        return Result.Ok(text.len());
-    }
-    var culprit = "";
-    var biggest = 0;
-    match (arguments) {
-        Json.JObject(m) => {
-            for k in m.keys() {
-                match (get(m, k)) {
-                    Option.Some(v) => {
-                        let size = json.stringify(v).len();
-                        if (size > biggest) {
-                            biggest = size;
-                            culprit = k;
-                        }
-                    },
-                    Option.None => { },
-                }
-            }
-        },
-        _ => { },
-    }
-    let hint = if (culprit == "") { "" } else { "; the argument '${culprit}' alone is ${biggest} bytes" };
-    Result.Err(
-        "the request is ${text.len()} bytes, over the ${MAX_BATCH}-byte limit of the stdio transport${hint}"
-    )
-}
-
 // ---------------------------------------------------------------- transporte
 
-// Lo que un canal de salida produjo, entero (acotado en `MAX_STDERR` para stderr).
-fn drain(channel: Channel<bytes>, cap: int) -> bytes {
-    var captured = b"";
+// El proceso vivo, propiedad exclusiva del actor: el handle, lo leído y aún no consumido
+// de su stdout, la siguiente `id` y lo que declaró al inicializarse.
+struct Live {
+    proc: process.Proc,
+    pending: bytes,
+    next_id: int,
+    instructions: string,
+    dead: bool,
+}
+
+// Deja pasar stderr sin guardarlo: si nadie lo lee, el canal acotado se llena y el
+// servidor se bloquea escribiendo un log.
+fn discard(channel: Channel<bytes>) {
     var draining = true;
     while (draining) {
         match (recv(channel)) {
-            Option.Some(chunk) => {
-                if (cap <= 0 || captured.len() < cap) {
-                    captured = captured + chunk;
-                }
-            },
+            Option.Some(_) => { },
             Option.None => {
                 draining = false;
             },
         }
     }
-    captured
 }
 
-// Una tirada completa: lanza el servidor, le entrega el lote, drena stdout y stderr y
-// devuelve la respuesta con la `id` pedida. Se lanza en STREAMING —como `run_command`—
-// porque drenar el canal aparca la fibra y deja vivo el indicador, mientras que `run()`
-// congelaría el planificador. El plazo se compone a mano: fibra guardiana + `kill`.
-// Devuelve el `result` de la petición y el del `initialize` (vacío si no llegó): ahí viajan
-// las `instructions` del servidor, que solo interesan al descubrir.
-fn exchange(s: Server, method: string, params: Json, timeout_ms: int) -> Result<(Json, Json), string> {
-    let text = batch(method, params);
-    check_size(text, params)?;
-    var command = process.cmd(s.command, s.args).stdin(text.to_bytes());
+fn exit_label(code: process.Exit) -> string {
+    match (code) {
+        process.Exit.Code(c) => "exit ${c}",
+        process.Exit.Signal(sig) => "signal ${sig}",
+    }
+}
+
+// La siguiente línea completa del búfer, si la hay. Un trozo puede partir un carácter:
+// entonces se espera al siguiente en vez de decodificar a medias.
+fn take_line(live: Live) -> Option<string> {
+    match (from_utf8(live.pending)) {
+        Result.Err(_) => Option.None,
+        Result.Ok(text) => match (text.index_of("\n")) {
+            Option.None => Option.None,
+            Option.Some(i) => {
+                live.pending = text.substring(i + 1, text.len()).to_bytes();
+                Option.Some(text.substring(0, i))
+            },
+        },
+    }
+}
+
+// Mata el proceso y lo da por muerto: la siguiente petición lo relanza.
+fn bury(live: Live) {
+    live.proc.kill(true);
+    live.proc.wait();
+    live.dead = true;
+}
+
+// Espera la respuesta con `id`, saltando lo que no sea (notificaciones, logs). Un plazo
+// vencido o un EOF matan la sesión: el error dice cuál de los dos.
+fn await_reply(live: Live, id: int, timeout_ms: int) -> Result<Json, string> {
+    let deadline = time.monotonic() + timeout_ms;
+    while (true) {
+        var scanning = true;
+        while (scanning) {
+            match (take_line(live)) {
+                Option.None => {
+                    scanning = false;
+                },
+                Option.Some(line) => {
+                    if (line.trim() != "") {
+                        match (json.parse(line.trim())) {
+                            Result.Err(_) => { },
+                            Result.Ok(reply) => match (json.get_int(reply, "id")) {
+                                Option.Some(found) => {
+                                    if (found == id) {
+                                        return result_of(reply);
+                                    }
+                                },
+                                Option.None => { },
+                            },
+                        }
+                    }
+                },
+            }
+        }
+        let remaining = deadline - time.monotonic();
+        if (remaining <= 0) {
+            bury(live);
+            return Result.Err("no reply after ${timeout_ms}ms; the server was killed");
+        }
+        match (select_timeout([live.proc.out], remaining)) {
+            Option.None => {
+                bury(live);
+                return Result.Err("no reply after ${timeout_ms}ms; the server was killed");
+            },
+            Option.Some(_) => match (recv(live.proc.out)) {
+                Option.Some(chunk) => {
+                    live.pending = live.pending + chunk;
+                },
+                Option.None => {
+                    let status = exit_label(live.proc.wait());
+                    live.dead = true;
+                    return Result.Err("the server exited (${status}) before answering");
+                },
+            },
+        }
+    }
+    Result.Err("unreachable")
+}
+
+// Escribe una línea al stdin del servidor. `write` aparca la fibra si el pipe se llena
+// (contrapresión real) y devuelve Err si el servidor cerró su stdin o murió.
+fn write_line(live: Live, text: string) -> Result<int, string> {
+    match (live.proc.write((text + "\n").to_bytes())) {
+        Result.Ok(n) => Result.Ok(n),
+        Result.Err(e) => {
+            live.dead = true;
+            Result.Err("cannot write to the server (${e})")
+        },
+    }
+}
+
+// Lanza el proceso y hace el apretón de manos.
+fn launch(s: Server, timeout_ms: int) -> Result<Live, string> {
+    var command = process.cmd(s.command, s.args).stdin_pipe();
     command = command.dir(if (s.dir.trim() == "") { ui.workspace() } else { ui.resolve_path(s.dir) });
     for k in s.env.keys() {
         match (get(s.env, k)) {
@@ -476,76 +547,156 @@ fn exchange(s: Server, method: string, params: Json, timeout_ms: int) -> Result<
             return Result.Err("cannot start '${s.command}': ${e}");
         },
     };
-    let started = time.monotonic();
     spawn(fn() {
-        time.sleep(timeout_ms);
-        p.kill(true);
+        discard(p.err);
     });
-    // stderr se drena en su propia fibra: si el servidor escribe mucho por ahí y nadie
-    // lee, el canal acotado se llena y el hijo se bloquea sin llegar a contestar.
-    let errors: Channel<bytes> = Channel.new();
-    spawn(fn() {
-        send(errors, drain(p.err, MAX_STDERR));
-    });
-    let out = drain(p.out, 0);
-    let elapsed = time.monotonic() - started;
-    let status = match (p.wait()) {
-        process.Exit.Code(c) => "exit ${c}",
-        process.Exit.Signal(sig) => "signal ${sig}",
+    let live = Live { proc: p, pending: b"", next_id: HELLO_ID + 1, instructions: "", dead: false };
+    let hello: Result<Json, string> = match (write_line(live, handshake().trim())) {
+        Result.Ok(_) => await_reply(live, HELLO_ID, timeout_ms),
+        Result.Err(e) => Result.Err(e),
     };
-    let stderr = match (recv(errors)) {
-        Option.Some(b) => match (from_utf8(b)) {
-            Result.Ok(t) => t.trim(),
-            Result.Err(_) => "",
+    match (hello) {
+        Result.Err(e) => {
+            if (!live.dead) {
+                bury(live);
+            }
+            Result.Err("initialize failed: ${e}")
         },
-        Option.None => "",
-    };
-    let output = match (from_utf8(out)) {
-        Result.Ok(t) => t,
-        Result.Err(_) => {
-            return Result.Err("the server wrote non-UTF-8 output");
-        },
-    };
-    let hello = match (pick(output, HELLO_ID)) {
-        Option.Some(reply) => match (result_of(reply)) {
-            Result.Ok(r) => r,
-            Result.Err(_) => empty_object(),
-        },
-        Option.None => empty_object(),
-    };
-    match (pick(output, REQUEST_ID)) {
-        Option.Some(reply) => match (result_of(reply)) {
-            Result.Ok(r) => Result.Ok((r, hello)),
-            Result.Err(e) => Result.Err(e),
-        },
-        Option.None => {
-            let why = if (elapsed >= timeout_ms) {
-                "timed out after ${timeout_ms}ms"
-            } else {
-                "no reply to ${method} (${status})"
+        Result.Ok(result) => {
+            live.instructions = match (json.get_string(result, "instructions")) {
+                Option.Some(text) => text.trim(),
+                Option.None => "",
             };
-            let detail = if (stderr == "") { "" } else { "\n" + ui.clip(stderr, MAX_STDERR) };
-            Result.Err("${s.command}: ${why}${detail}")
+            Result.Ok(live)
         },
     }
 }
 
-/// `initialize` + `tools/list` against `s`. On failure the server is marked unavailable
-/// with the reason in `note`; on success `note` is cleared and `tool_count` set.
+// Una petición sobre la sesión viva.
+fn exchange(live: Live, method: string, params: Json, timeout_ms: int) -> Result<Answer, string> {
+    let id = live.next_id;
+    live.next_id = live.next_id + 1;
+    write_line(live, request(id, method, params))?;
+    let result = await_reply(live, id, timeout_ms)?;
+    Result.Ok(Answer { result: result, instructions: live.instructions })
+}
+
+// Cierra la sesión por las buenas (EOF en stdin) y, si el servidor no se va, a la fuerza.
+fn hang_up(live: Live) {
+    if (live.dead) {
+        return;
+    }
+    live.proc.close_stdin();
+    spawn(fn() {
+        time.sleep(STOP_GRACE_MS);
+        live.proc.kill(true);
+    });
+    live.proc.wait();
+    live.dead = true;
+}
+
+// El actor: la única fibra que toca el proceso. Atiende peticiones hasta que le mandan
+// parar; un servidor caído se relanza en la siguiente petición.
+fn serve(s: Server) {
+    var live: Option<Live> = Option.None;
+    var serving = true;
+    while (serving) {
+        match (recv(s.link)) {
+            Option.None => {
+                serving = false;
+            },
+            Option.Some(req) => match (req) {
+                Request.Stop(ack) => {
+                    match (live) {
+                        Option.Some(l) => hang_up(l),
+                        Option.None => { },
+                    }
+                    live = Option.None;
+                    serving = false;
+                    send(ack, 1);
+                },
+                Request.Ask(method, params, timeout_ms, reply) => {
+                    let ready: Result<Live, string> = match (live) {
+                        Option.Some(l) => Result.Ok(l),
+                        Option.None => launch(s, timeout_ms),
+                    };
+                    match (ready) {
+                        Result.Err(e) => {
+                            let failed: Result<Answer, string> = Result.Err(e);
+                            send(reply, failed);
+                        },
+                        Result.Ok(l) => {
+                            let outcome = exchange(l, method, params, timeout_ms);
+                            live = if (l.dead) { Option.None } else { Option.Some(l) };
+                            send(reply, outcome);
+                        },
+                    }
+                },
+            },
+        }
+    }
+}
+
+/// Starts the server's actor (its process is launched on the first request).
+pub fn start(s: Server) {
+    if (s.running) {
+        return;
+    }
+    s.running = true;
+    spawn(fn() {
+        serve(s);
+    });
+}
+
+/// Stops the server's actor and its process, waiting until both are gone.
+pub fn stop(s: Server) {
+    if (!s.running) {
+        return;
+    }
+    let ack: Channel<int> = Channel.new();
+    send(s.link, Request.Stop(ack));
+    recv(ack);
+    s.running = false;
+}
+
+/// Stops every server: what the harness does on the way out.
+pub fn shutdown(servers: [Server]) {
+    for s in servers {
+        stop(s);
+    }
+}
+
+/// One request to the server, from any fiber: it goes through the actor's channel.
+pub fn ask(s: Server, method: string, params: Json, timeout_ms: int) -> Result<Answer, string> {
+    if (!s.running) {
+        return Result.Err("the MCP server '${s.name}' is not running");
+    }
+    let reply: Channel<Result<Answer, string>> = Channel.new();
+    send(s.link, Request.Ask(method, params, timeout_ms, reply));
+    match (recv(reply)) {
+        Option.Some(outcome) => outcome,
+        Option.None => Result.Err("the MCP server '${s.name}' went away"),
+    }
+}
+
+/// (Re)starts `s` and asks for its catalogue. On failure the server is stopped and marked
+/// unavailable with the reason in `note`; on success `note` is cleared, `tool_count` and
+/// `instructions` are set, and the session stays up for the calls to come.
 pub fn discover(s: Server, timeout_ms: int) -> Result<[RemoteTool], string> {
+    stop(s);
     if (!s.enabled) {
         return Result.Ok([]);
     }
-    var hello = empty_object();
-    let outcome: Result<[RemoteTool], string> = match (exchange(
+    start(s);
+    let outcome: Result<[RemoteTool], string> = match (ask(
         s,
         "tools/list",
         empty_object(),
         timeout_ms
     )) {
-        Result.Ok(pair) => {
-            hello = pair.1;
-            parse_tools(pair.0)
+        Result.Ok(answer) => {
+            s.instructions = answer.instructions;
+            parse_tools(answer.result)
         },
         Result.Err(e) => Result.Err(e),
     };
@@ -553,12 +704,9 @@ pub fn discover(s: Server, timeout_ms: int) -> Result<[RemoteTool], string> {
         Result.Ok(tools) => {
             s.note = "";
             s.tool_count = tools.len();
-            s.instructions = match (json.get_string(hello, "instructions")) {
-                Option.Some(text) => text.trim(),
-                Option.None => "",
-            };
         },
         Result.Err(e) => {
+            stop(s);
             s.enabled = false;
             s.note = e;
             s.tool_count = 0;
@@ -571,8 +719,8 @@ pub fn discover(s: Server, timeout_ms: int) -> Result<[RemoteTool], string> {
 /// `tools/call` of `tool` (the raw server-side name) with the parsed `arguments`.
 pub fn call(s: Server, tool: string, arguments: Json, timeout_ms: int) -> Result<string, string> {
     let params = obj(["name", "arguments"], [jstr(tool), arguments]);
-    let pair = exchange(s, "tools/call", params, timeout_ms)?;
-    flatten(pair.0)
+    let answer = ask(s, "tools/call", params, timeout_ms)?;
+    flatten(answer.result)
 }
 
 /// What every enabled server asked to put in the system prompt, one labelled block per
@@ -581,7 +729,9 @@ pub fn instructions_of(servers: [Server]) -> string {
     var blocks: [string] = [];
     for s in servers {
         if (s.enabled && s.instructions != "") {
-            blocks.push("Instructions from the MCP server '${s.name}' (its tools are prefixed mcp__${s.name}__):\n${s.instructions}");
+            blocks.push(
+                "Instructions from the MCP server '${s.name}' (its tools are prefixed mcp__${s.name}__):\n${s.instructions}"
+            );
         }
     }
     blocks.join("\n\n")
