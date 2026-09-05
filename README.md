@@ -229,8 +229,9 @@ escritura por adelantado.
 | `/model` | el modelo en uso y el catálogo del endpoint (`GET /v1/models`), con el actual marcado |
 | `/model <id>` | cambia de modelo en caliente, conservando la conversación |
 | `/tools` | las herramientas expuestas al modelo, con su origen |
-| `/mcp` | los servidores MCP: mandato, herramientas y último error |
-| `/mcp reload` | vuelve a descubrir los servidores MCP, conservando la conversación |
+| `/mcp` | los servidores MCP: mandato, herramientas, recursos y último error |
+| `/mcp reload` | reinicia los servidores MCP, conservando la conversación |
+| `/resource <uri>` | mete un recurso MCP en la conversación (el modelo tiene `read_resource`) |
 | `/set [clave valor]` | mandos en caliente: `max-tokens`, `temperature`, `max-steps`, `timeout-ms` (sin argumentos, los muestra junto a `stream`) |
 | `/system <texto>` | reemplaza el prompt de sistema (vacío: lo muestra) |
 | `/reset` | olvida la conversación, conserva los totales |
@@ -285,6 +286,14 @@ nombre (`/system` muestra solo la parte del usuario; `/mcp` enseña las del serv
 Los resultados llegan al modelo como texto: los bloques `text` tal cual, los demás
 resumidos (`[image 12 KiB]`), e `isError` por el mismo camino que cualquier fallo de
 herramienta —error legible, nunca un panic.
+
+**Recursos.** Lo que un servidor publica por `resources/list` entra de dos maneras. El
+modelo recibe una herramienta `read_resource` cuya descripción lleva el catálogo (URI,
+nombre y descripción de cada recurso), así que puede leer `raylang://llms.txt` cuando las
+instrucciones del servidor se lo piden, con un tope de 64 KiB por lectura. Y el usuario
+tiene `/resource <uri>`, que lee el recurso entero y lo mete en la conversación como un
+turno propio —lo que haría pegándolo—, diciendo cuántos caracteres y tokens aproximados
+costó. Los recursos binarios se resumen (`[blob 12 KiB image/png]`).
 
 Con `ray mcp` el bucle es el de escribir raylang y verificarlo en el mismo turno:
 

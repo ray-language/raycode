@@ -18,6 +18,7 @@ import src/usage;
 import src/lineedit;
 import src/ui;
 import src/mcp;
+import src/message;
 
 // La cabecera: qué modelo, contra qué endpoint, con qué herramientas. Lo que el endpoint
 // declare sobre el modelo cargado se muestra junto a lo configurado.
@@ -73,7 +74,14 @@ fn mcp_summary(server: mcp.Server) -> string {
     let launch = ui.dim(" · " + mcp.command_line(server));
     if (server.enabled) {
         let count = if (server.tool_count == 1) { "1 tool" } else { "${server.tool_count} tools" };
-        ui.bold(server.name) + launch + ui.dim(" · ${count}")
+        let published = if (server.resources.len() == 0) {
+            ""
+        } else if (server.resources.len() == 1) {
+            " · 1 resource"
+        } else {
+            " · ${server.resources.len()} resources"
+        };
+        ui.bold(server.name) + launch + ui.dim(" · ${count}${published}")
     } else {
         ui.bold(server.name) + launch + " " + ui.red("✗ " + ui.clip(server.note, 120))
     }
@@ -102,6 +110,53 @@ fn show_mcp(s: agent.Session) {
                 print(ui.dim(ui.indent(ui.clip(t.description, 300), "      ")));
             }
         }
+        for r in server.resources {
+            let label = if (r.name == "") { "" } else { ui.dim(" · " + r.name) };
+            print("    " + r.uri + label);
+            if (r.description != "") {
+                print(ui.dim(ui.indent(ui.clip(r.description, 300), "      ")));
+            }
+        }
+    }
+    if (mcp
+    .all_resources(s.mcp)
+    .len() > 0) {
+        print(
+            ui.dim(
+                "  /resource <uri> puts a resource into the conversation; the model has read_resource"
+            )
+        );
+    }
+}
+
+// Lee un recurso y lo mete en la conversación como turno del usuario: es lo que haría el
+// usuario pegándolo, y es lo que todos los proveedores aceptan sin más.
+fn inject_resource(s: agent.Session, uri: string) {
+    let server = match (mcp.publisher(s.mcp, uri)) {
+        Option.Some(found) => found,
+        Option.None => {
+            print(ui.red("! ") + "no MCP server publishes '${uri}' (/mcp lists them)");
+            return;
+        },
+    };
+    match (mcp.read_resource(
+    server,
+    uri,
+    mcp.CALL_TIMEOUT_MS
+)) {
+        Result.Err(e) => print(ui.red("! ") + e),
+        Result.Ok(text) => {
+            s.history.push(
+                message.user(
+                    "Contents of the MCP resource ${uri} (server '${server.name}'), for reference:\n\n" + text
+                )
+            );
+            print(
+                ui.dim(
+                    "added ${uri} to the conversation (${ui.fmt_count(text.len())} characters, ~${ui.fmt_count(text.len() / 4)} tokens)"
+                )
+            );
+        },
     }
 }
 
@@ -114,6 +169,7 @@ fn commands() -> [string] {
         "/set",
         "/tools",
         "/mcp",
+        "/resource",
         "/system",
         "/reset",
         "/verbose",
@@ -129,7 +185,10 @@ fn help() {
     print("  /model [<id>]      the current model and the endpoint's catalogue; switch with an id");
     print("  /set [k v]         knobs: max-tokens, temperature, max-steps, timeout-ms, stream");
     print("  /tools             the tools exposed to the model");
-    print("  /mcp [reload]      the MCP servers, their tools and errors; reload rediscovers them");
+    print(
+        "  /mcp [reload]      the MCP servers, their tools, resources and errors; reload restarts them"
+    );
+    print("  /resource <uri>    put an MCP resource into the conversation");
     print("  /system <text>     replace the system prompt (empty: show it)");
     print("  /reset             forget the transcript, keep the session totals");
     print("  /verbose           toggle request/response tracing on stderr");
@@ -294,6 +353,12 @@ fn command(s: agent.Session, line: string) -> bool {
             print(ui.dim("mcp servers rediscovered"));
         }
         show_mcp(s);
+    } else if (name == "/resource") {
+        if (rest == "") {
+            print(ui.red("! ") + "usage: /resource <uri> (/mcp lists the available ones)");
+        } else {
+            inject_resource(s, rest);
+        }
     } else if (name == "/model") {
         if (rest == "") {
             show_model(s);

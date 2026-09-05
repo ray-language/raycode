@@ -123,7 +123,9 @@ anticipaba), y `src/mcp.ray` sostiene una sesión por servidor en un actor —un
 posee el proceso y atiende peticiones por canal—, con relanzamiento tras muerte o plazo
 vencido y cierre ordenado al salir. El tope de 60 KiB desapareció con él: `Proc.write`
 aparca la fibra con contrapresión en vez de clavar la VM. Las `instructions` del
-`initialize` van al prompt de sistema. Queda la fase 3 (recursos) y 4b (HTTP/SSE).
+`initialize` van al prompt de sistema. Fase 3 hecha: `resources/list` en el descubrimiento,
+`read_resource` como herramienta única con el catálogo en su descripción, y `/resource
+<uri>` para inyectar uno a mano. Queda la 4b (HTTP/SSE).
 
 ## Fases
 

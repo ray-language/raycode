@@ -743,6 +743,47 @@ fn mcp_flatten_joins_text_and_turns_is_error_into_err() {
 }
 
 @test
+fn mcp_resources_list_and_read_are_parsed() {
+    let listed = match (json.parse(
+        `{"resources":[{"uri":"x://a","name":"A","description":"about a","mimeType":"text/plain"},{"uri":"x://b"}]}`
+    )) {
+        Result.Ok(j) => j,
+        Result.Err(e) => panic(e),
+    };
+    match (mcp.parse_resources(listed)) {
+        Result.Err(e) => panic(e),
+        Result.Ok(r) => {
+            assert_eq(r.len(), 2);
+            assert_eq(r[0].uri, "x://a");
+            assert_eq(r[0].name, "A");
+            assert_eq(r[0].mime, "text/plain");
+            assert_eq(r[1].name, "");
+        },
+    }
+    let read = match (json.parse(
+        `{"contents":[{"uri":"x://a","mimeType":"text/plain","text":"hello"},{"uri":"x://b","mimeType":"image/png","blob":"AAAAAAAA"}]}`
+    )) {
+        Result.Ok(j) => j,
+        Result.Err(e) => panic(e),
+    };
+    match (mcp.flatten_contents(read)) {
+        Result.Ok(text) => assert_eq(text, "hello\n[blob 0 KiB image/png]"),
+        Result.Err(e) => panic(e),
+    }
+    // Un servidor sin recursos no tiene lista: no es un fallo, es una lista vacía.
+    let servers = match (mcp.parse_config(
+        `{"mcpServers":{"flaky":{"command":"sh","args":["${flaky_server_script()}"]}}}`
+    )) {
+        Result.Ok(s) => s,
+        Result.Err(e) => panic(e),
+    };
+    let catalogue = tools.from_servers(servers);
+    assert_eq(servers[0].resources.len(), 0);
+    assert(!tools.offers(catalogue, tools.READ_RESOURCE));
+    mcp.shutdown(servers);
+}
+
+@test
 fn mcp_tools_list_becomes_remote_tools() {
     let result = match (json.parse(
         `{"tools":[{"name":"a","description":"A","inputSchema":{"type":"object","properties":{"x":{"type":"string"}}}},{"name":"b"}]}`
@@ -797,8 +838,9 @@ fn mcp_remote_tools_enter_the_catalogue_and_dispatch() {
         catalogue,
         [message.user("hi")]
     );
-    assert(!anthropic_body.contains("llms.txt"));
-    assert_eq(servers[0].tool_count, catalogue.len());
+    assert(!anthropic_body.contains("Instructions from the MCP server"));
+    // El catálogo son las herramientas del servidor más `read_resource` para sus recursos.
+    assert_eq(servers[0].tool_count + 1, catalogue.len());
     assert(tools.offers(catalogue, "mcp__raylang__ray_check"));
     assert_eq(catalogue[0].source, "raylang");
     let verdict = tools.execute(

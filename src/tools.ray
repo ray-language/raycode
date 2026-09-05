@@ -49,6 +49,14 @@ fn int_or(a: Json, name: string, fallback: int) -> int {
 
 const MAX_OUTPUT: int = 12000;
 
+// Tope para un recurso MCP leído por el modelo: son documentos de contexto (un `llms.txt`
+// pasa de los 12 KB de una salida normal) y se piden a propósito, así que el tope es mayor.
+const MAX_RESOURCE: int = 65536;
+
+/// The tool through which the model reads MCP resources; present only when a server
+/// publishes some.
+pub const READ_RESOURCE: string = "read_resource";
+
 // Tope de lectura de un archivo. Un volcado de 2 GB no puede tumbar la sesión por el mero
 // hecho de que el modelo lo nombre; para mirar código, 1 MiB sobra de largo.
 const MAX_READ: int = 1048576;
@@ -275,7 +283,51 @@ pub fn from_servers(servers: [Server]) -> [Tool] {
             Result.Err(_) => { },
         }
     }
+    // Un solo `read_resource` para todos los servidores, con el catálogo en la descripción:
+    // así el modelo sabe qué existe sin una llamada de lista.
+    let resources = mcp.all_resources(servers);
+    if (resources.len() > 0) {
+        var lines: [string] = [];
+        for r in resources {
+            let label = if (r.name == "") { "" } else { " — ${r.name}" };
+            let about = if (r.description == "") { "" } else { ": ${r.description}" };
+            lines.push("- ${r.uri}${label}${about}");
+        }
+        tools.push(
+            Tool {
+                name: READ_RESOURCE,
+                description: "Read a resource published by an MCP server, by URI. Available resources:\n" + lines.join("\n"),
+                schema: schema_of(
+                    `{"type":"object","properties":{"uri":{"type":"string","description":"The resource URI, exactly as listed"}},"required":["uri"]}`
+                ),
+                source: "mcp"
+            }
+        );
+    }
     tools
+}
+
+// La lectura de un recurso, con el tope de contexto de un documento y el aviso de corte.
+fn tool_read_resource(servers: [Server], a: Json) -> Result<string, string> {
+    let uri = need_string(a, "uri")?;
+    let server = match (mcp.publisher(servers, uri)) {
+        Option.Some(s) => s,
+        Option.None => {
+            var known: [string] = [];
+            for r in mcp.all_resources(servers) {
+                known.push(r.uri);
+            }
+            return Result.Err("no MCP server publishes '${uri}' (available: ${known.join(", ")})");
+        },
+    };
+    let text = mcp.read_resource(server, uri, mcp.CALL_TIMEOUT_MS)?;
+    if (text.len() <= MAX_RESOURCE) {
+        Result.Ok(text)
+    } else {
+        Result.Ok(
+            text.substring(0, MAX_RESOURCE) + "\n… [truncated, ${text.len() - MAX_RESOURCE} more characters]"
+        )
+    }
 }
 
 /// True when the registry offers a tool by that name.
@@ -315,6 +367,8 @@ fn dispatch_remote(servers: [Server], name: string, arguments: Json) -> Result<s
 fn dispatch(servers: [Server], name: string, arguments: Json) -> Result<string, string> {
     if (mcp.is_remote(name)) {
         dispatch_remote(servers, name, arguments)
+    } else if (name == READ_RESOURCE) {
+        tool_read_resource(servers, arguments)
     } else if (name == "read_file") {
         tool_read_file(arguments)
     } else if (name == "write_file") {

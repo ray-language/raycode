@@ -30,8 +30,17 @@ pub struct Server {
     note: string,
     tool_count: int,
     instructions: string,
+    resources: [Resource],
     link: Channel<Request>,
     running: bool,
+}
+
+/// One resource a server publishes: something the model (or the user) can read by URI.
+pub struct Resource {
+    uri: string,
+    name: string,
+    description: string,
+    mime: string,
 }
 
 /// What the harness sends to a server's actor: a request to forward, or the order to stop.
@@ -216,7 +225,7 @@ fn parse_server(name: string, spec: Json) -> Result<Server, string> {
     };
     let link: Channel<Request> = Channel.new();
     Result.Ok(
-        Server { name: name, command: command, args: arguments, dir: dir, env: environment, enabled: !disabled, note: if (disabled) { "disabled in the configuration" } else { "" }, tool_count: 0, instructions: "", link: link, running: false }
+        Server { name: name, command: command, args: arguments, dir: dir, env: environment, enabled: !disabled, note: if (disabled) { "disabled in the configuration" } else { "" }, tool_count: 0, instructions: "", resources: [], link: link, running: false }
     )
 }
 
@@ -377,6 +386,68 @@ pub fn flatten(result: Json) -> Result<string, string> {
     } else {
         Result.Ok(text)
     }
+}
+
+/// The resources a `resources/list` result declares.
+pub fn parse_resources(result: Json) -> Result<[Resource], string> {
+    let items = match (json.get_array(result, "resources")) {
+        Option.Some(r) => r,
+        Option.None => {
+            return Result.Err("the reply to resources/list has no \"resources\" list");
+        },
+    };
+    var resources: [Resource] = [];
+    for item in items {
+        let uri = match (json.get_string(item, "uri")) {
+            Option.Some(u) => u,
+            Option.None => {
+                return Result.Err("a resource in resources/list has no uri");
+            },
+        };
+        let text_of = fn(key: string) -> string {
+            match (json.get_string(item, key)) {
+                Option.Some(v) => v,
+                Option.None => "",
+            }
+        };
+        resources.push(
+            Resource {
+                uri: uri,
+                name: text_of("name"),
+                description: text_of("description"),
+                mime: text_of("mimeType")
+            }
+        );
+    }
+    Result.Ok(resources)
+}
+
+/// The text of a `resources/read` result: its `contents` joined, text entries verbatim
+/// and binary ones summarised (`[blob 12 KiB image/png]`).
+pub fn flatten_contents(result: Json) -> Result<string, string> {
+    let entries = match (json.get_array(result, "contents")) {
+        Option.Some(c) => c,
+        Option.None => {
+            return Result.Err("the reply to resources/read has no \"contents\" list");
+        },
+    };
+    var parts: [string] = [];
+    for entry in entries {
+        match (json.get_string(entry, "text")) {
+            Option.Some(text) => parts.push(text),
+            Option.None => match (json.get_string(entry, "blob")) {
+                Option.Some(blob) => {
+                    let mime = match (json.get_string(entry, "mimeType")) {
+                        Option.Some(m) => " " + m,
+                        Option.None => "",
+                    };
+                    parts.push("[blob ${blob.len() * 3 / 4 / 1024} KiB${mime}]");
+                },
+                Option.None => { },
+            },
+        }
+    }
+    Result.Ok(parts.join("\n"))
 }
 
 /// The tools a `tools/list` result declares. A tool without a schema gets an empty
@@ -704,6 +775,15 @@ pub fn discover(s: Server, timeout_ms: int) -> Result<[RemoteTool], string> {
         Result.Ok(tools) => {
             s.note = "";
             s.tool_count = tools.len();
+            // Los recursos son opcionales en el protocolo: un servidor sin ellos contesta
+            // con un error de método, y eso no es un fallo del servidor.
+            s.resources = match (ask(s, "resources/list", empty_object(), timeout_ms)) {
+                Result.Ok(answer) => match (parse_resources(answer.result)) {
+                    Result.Ok(r) => r,
+                    Result.Err(_) => [],
+                },
+                Result.Err(_) => [],
+            };
         },
         Result.Err(e) => {
             stop(s);
@@ -711,6 +791,7 @@ pub fn discover(s: Server, timeout_ms: int) -> Result<[RemoteTool], string> {
             s.note = e;
             s.tool_count = 0;
             s.instructions = "";
+            s.resources = [];
         },
     }
     outcome
@@ -721,6 +802,37 @@ pub fn call(s: Server, tool: string, arguments: Json, timeout_ms: int) -> Result
     let params = obj(["name", "arguments"], [jstr(tool), arguments]);
     let answer = ask(s, "tools/call", params, timeout_ms)?;
     flatten(answer.result)
+}
+
+/// `resources/read` of `uri`, as text.
+pub fn read_resource(s: Server, uri: string, timeout_ms: int) -> Result<string, string> {
+    let answer = ask(s, "resources/read", obj(["uri"], [jstr(uri)]), timeout_ms)?;
+    flatten_contents(answer.result)
+}
+
+/// The server that publishes `uri`, if any.
+pub fn publisher(servers: [Server], uri: string) -> Option<Server> {
+    for s in servers {
+        if (s.enabled) {
+            for r in s.resources {
+                if (r.uri == uri) {
+                    return Option.Some(s);
+                }
+            }
+        }
+    }
+    Option.None
+}
+
+/// Every resource of every enabled server, in configuration order.
+pub fn all_resources(servers: [Server]) -> [Resource] {
+    var out: [Resource] = [];
+    for s in servers {
+        if (s.enabled) {
+            out = out + s.resources;
+        }
+    }
+    out
 }
 
 /// What every enabled server asked to put in the system prompt, one labelled block per
