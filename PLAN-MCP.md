@@ -115,6 +115,14 @@ y la sesión sigue con el resto. `/mcp reload` reintenta sin perder la conversac
 
 `/mcp` entra en `commands()` para que Tab lo complete.
 
+## Estado
+
+Fases 1 y 2 hechas (`src/mcp.ray`, `Tool.source`, `Session.mcp`, `.raycode/mcp.json`,
+banner, `/mcp`, `/mcp reload`, origen en `/tools`, tope de 60 KiB, plazos, errores
+legibles). Novedad respecto a la medición de arriba: raylang 1.6.2 ya trae
+`Cmd.stdin_pipe()` + `Proc.write` / `Proc.close_stdin`, así que la fase 4a (sesión
+persistente) ha dejado de estar bloqueada por el runtime.
+
 ## Fases
 
 1. **Protocolo y despacho.** `src/mcp.ray`, `Tool.source`, `Session.mcp`, config

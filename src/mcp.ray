@@ -1,0 +1,562 @@
+// Cliente MCP (Model Context Protocol) por stdio. Las herramientas de un servidor MCP
+// entran en el catálogo que raycode ofrece al modelo, junto a `read_file` y compañía,
+// sin que el bucle del agente distinga unas de otras.
+//
+// Transporte: UN PROCESO POR LLAMADA. Cada operación (`tools/list` al abrir la sesión,
+// `tools/call` en cada uso) lanza el servidor, le manda por stdin el apretón de manos y
+// la petición en un solo lote, drena su stdout hasta EOF y se queda con la línea cuya
+// `id` es la de la petición. Es lo que hace viable un catálogo sin sesión persistente:
+// vale para servidores sin estado entre llamadas (`ray mcp` lo es, ~5 ms por llamada),
+// y el coste de arranque se paga en cada uso. Una sesión larga sobre `stdin_pipe` es la
+// siguiente fase, no esta.
+import std/json;
+import std/process;
+import std/time;
+import std/fs;
+import src/ui;
+from std/json import Json;
+
+/// One MCP server as configured, plus what discovery learned about it. `note` keeps
+/// the last error (empty when healthy) and `tool_count` what the catalogue holds.
+pub struct Server {
+    name: string,
+    command: string,
+    args: [string],
+    dir: string,
+    env: Map<string, string>,
+    enabled: bool,
+    note: string,
+    tool_count: int,
+}
+
+/// A tool as the server declares it: raw name, description and its JSON Schema. It is
+/// `src/tools` who wraps it into the catalogue, so this module never imports it.
+pub struct RemoteTool {
+    name: string,
+    description: string,
+    schema: Json,
+}
+
+/// The wire version this client speaks.
+pub const PROTOCOL_VERSION: string = "2024-11-05";
+
+/// How long `tools/list` may take per server before the server is marked unavailable.
+pub const DISCOVER_TIMEOUT_MS: int = 5000;
+
+/// How long one `tools/call` may take before the server process is killed.
+pub const CALL_TIMEOUT_MS: int = 60000;
+
+// Tope del lote que va por stdin. El `write_all` del runtime es síncrono: si el lote
+// pasa del búfer del pipe y el hijo no consume, clavaría el hilo de la VM entera. Se
+// rechaza antes, con un error que dice qué argumento se pasó.
+const MAX_BATCH: int = 61440;
+
+// Cuánto se guarda de stderr para el mensaje de error (solo la cola).
+const MAX_STDERR: int = 2048;
+
+// La `id` de la petición útil del lote: `initialize` lleva la 1.
+const REQUEST_ID: int = 2;
+
+const NAME_PREFIX: string = "mcp__";
+
+const NAME_SEPARATOR: string = "__";
+
+fn jstr(s: string) -> Json {
+    Json.JStr(s)
+}
+
+fn obj(keys: [string], values: [Json]) -> Json {
+    var m: Map<string, Json> = Map.new();
+    var i = 0;
+    while (i < keys.len() && i < values.len()) {
+        m.insert(keys[i], values[i]);
+        i = i + 1;
+    }
+    Json.JObject(m)
+}
+
+// El objeto vacío como Json.
+fn empty_object() -> Json {
+    let m: Map<string, Json> = Map.new();
+    Json.JObject(m)
+}
+
+/// The name the model sees for tool `tool` of server `server`: `mcp__<server>__<tool>`,
+/// the convention Claude Code uses, so names never collide with the builtins and the
+/// origin reads off the trace.
+pub fn tool_name(server: string, tool: string) -> string {
+    NAME_PREFIX + server + NAME_SEPARATOR + tool
+}
+
+/// True when `name` is the exposed name of an MCP tool.
+pub fn is_remote(name: string) -> bool {
+    name.starts_with(NAME_PREFIX)
+}
+
+/// The inverse of `tool_name`: the server and the raw tool name, or None when `name`
+/// does not follow the convention.
+pub fn split_name(name: string) -> Option<(string, string)> {
+    if (!is_remote(name)) {
+        return Option.None;
+    }
+    let rest = name.substring(NAME_PREFIX.len(), name.len());
+    let cut = match (rest.index_of(NAME_SEPARATOR)) {
+        Option.Some(i) => i,
+        Option.None => -1,
+    };
+    if (cut <= 0 || cut + NAME_SEPARATOR.len() >= rest.len()) {
+        return Option.None;
+    }
+    Option.Some((rest.substring(0, cut), rest.substring(cut + NAME_SEPARATOR.len(), rest.len())))
+}
+
+/// The server called `name`, if configured.
+pub fn find(servers: [Server], name: string) -> Option<Server> {
+    for s in servers {
+        if (s.name == name) {
+            return Option.Some(s);
+        }
+    }
+    Option.None
+}
+
+// ---------------------------------------------------------------- configuración
+
+/// The configuration file to use: `explicit` when given, else `.raycode/mcp.json` in the
+/// workspace, else `~/.raycode/mcp.json`; None when none of them exists.
+pub fn config_path(explicit: string) -> Option<string> {
+    if (explicit.trim() != "") {
+        return Option.Some(explicit);
+    }
+    let local = ui.resolve_path(".raycode/mcp.json");
+    if (fs.is_file(local)) {
+        return Option.Some(local);
+    }
+    match (env("HOME")) {
+        Option.Some(home) => {
+            let global = home + "/.raycode/mcp.json";
+            if (fs.is_file(global)) { Option.Some(global) } else { Option.None }
+        },
+        Option.None => Option.None,
+    }
+}
+
+// Una lista de strings JSON; cualquier otra cosa es un error de configuración.
+fn string_list(j: Json, what: string) -> Result<[string], string> {
+    var out: [string] = [];
+    match (j) {
+        Json.JArray(items) => {
+            for item in items {
+                match (json.as_string(item)) {
+                    Option.Some(s) => out.push(s),
+                    Option.None => {
+                        return Result.Err("${what} must be a list of strings");
+                    },
+                }
+            }
+            Result.Ok(out)
+        },
+        _ => Result.Err("${what} must be a list of strings"),
+    }
+}
+
+// Un servidor del sobre `mcpServers`.
+fn parse_server(name: string, spec: Json) -> Result<Server, string> {
+    if (name.trim() == "" || name.contains(NAME_SEPARATOR)) {
+        return Result.Err("server name '${name}' is empty or contains '__'");
+    }
+    let command = match (json.get_string(spec, "command")) {
+        Option.Some(c) => c,
+        Option.None => {
+            return Result.Err("server '${name}' has no \"command\"");
+        },
+    };
+    let none: [string] = [];
+    let arguments = match (json.member(spec, "args")) {
+        Option.Some(a) => string_list(a, "server '${name}': \"args\"")?,
+        Option.None => none,
+    };
+    var environment: Map<string, string> = Map.new();
+    match (json.get_object(spec, "env")) {
+        Option.Some(m) => {
+            for k in m.keys() {
+                match (get(m, k)) {
+                    Option.Some(v) => match (json.as_string(v)) {
+                        Option.Some(s) => environment.insert(k, s),
+                        Option.None => {
+                            return Result.Err("server '${name}': env.${k} must be a string");
+                        },
+                    },
+                    Option.None => { },
+                }
+            }
+        },
+        Option.None => { },
+    }
+    let dir = match (json.get_string(spec, "dir")) {
+        Option.Some(d) => d,
+        Option.None => "",
+    };
+    let disabled = match (json.get_bool(spec, "disabled")) {
+        Option.Some(d) => d,
+        Option.None => false,
+    };
+    Result.Ok(
+        Server { name: name, command: command, args: arguments, dir: dir, env: environment, enabled: !disabled, note: if (disabled) { "disabled in the configuration" } else { "" }, tool_count: 0 }
+    )
+}
+
+/// Parses the standard `{"mcpServers": {name: {command, args, env, dir, disabled}}}`
+/// envelope (the one Claude Code and Claude Desktop use, so a block can be pasted as is).
+pub fn parse_config(text: string) -> Result<[Server], string> {
+    let root = json.parse(text)?;
+    let table = match (json.get_object(root, "mcpServers")) {
+        Option.Some(t) => t,
+        Option.None => {
+            return Result.Err("expected an object under \"mcpServers\"");
+        },
+    };
+    var servers: [Server] = [];
+    // Las claves ordenadas: el catálogo debe ser el mismo en cada arranque.
+    for name in table.keys().sort() {
+        match (get(table, name)) {
+            Option.Some(spec) => servers.push(parse_server(name, spec)?),
+            Option.None => { },
+        }
+    }
+    Result.Ok(servers)
+}
+
+/// The configured servers: an empty list when there is no configuration file, an error
+/// when there is one and it is unusable.
+pub fn load(explicit: string) -> Result<[Server], string> {
+    match (config_path(explicit)) {
+        Option.None => Result.Ok([]),
+        Option.Some(path) => {
+            let text = match (fs.read_file(path)) {
+                Result.Ok(t) => t,
+                Result.Err(e) => {
+                    return Result.Err("cannot read ${path}: ${e}");
+                },
+            };
+            match (parse_config(text)) {
+                Result.Ok(servers) => Result.Ok(servers),
+                Result.Err(e) => Result.Err("${path}: ${e}"),
+            }
+        },
+    }
+}
+
+// ---------------------------------------------------------------- protocolo
+
+// Una petición JSON-RPC como línea.
+fn request(id: int, method: string, params: Json) -> string {
+    json.stringify(
+        obj(
+            ["jsonrpc", "id", "method", "params"],
+            [jstr("2.0"), Json.JNum(id as float), jstr(method), params]
+        )
+    )
+}
+
+/// The stdin batch for one operation: `initialize`, the `initialized` notification and
+/// the request itself (id 2), one JSON line each.
+pub fn batch(method: string, params: Json) -> string {
+    let hello = request(
+        1,
+        "initialize",
+        obj(
+            ["protocolVersion", "capabilities", "clientInfo"],
+            [
+                jstr(PROTOCOL_VERSION),
+                empty_object(),
+                obj(["name", "version"], [jstr("raycode"), jstr("0.1.0")])
+            ]
+        )
+    );
+    let ready = json.stringify(
+        obj(["jsonrpc", "method"], [jstr("2.0"), jstr("notifications/initialized")])
+    );
+    hello + "\n" + ready + "\n" + request(REQUEST_ID, method, params) + "\n"
+}
+
+/// The reply line whose `id` is `id`, out of everything the server wrote to stdout.
+/// Lines that are not JSON (a stray log) are skipped.
+pub fn pick(output: string, id: int) -> Option<Json> {
+    for line in output.split("\n") {
+        if (line.trim() != "") {
+            match (json.parse(line.trim())) {
+                Result.Ok(j) => match (json.get_int(j, "id")) {
+                    Option.Some(found) => {
+                        if (found == id) {
+                            return Option.Some(j);
+                        }
+                    },
+                    Option.None => { },
+                },
+                Result.Err(_) => { },
+            }
+        }
+    }
+    Option.None
+}
+
+// El `result` de una respuesta, o el `error` del protocolo como Err.
+fn result_of(reply: Json) -> Result<Json, string> {
+    match (json.member(reply, "error")) {
+        Option.Some(e) => {
+            let text = match (json.get_string(e, "message")) {
+                Option.Some(m) => m,
+                Option.None => json.stringify(e),
+            };
+            let code = match (json.get_int(e, "code")) {
+                Option.Some(c) => " (code ${c})",
+                Option.None => "",
+            };
+            Result.Err("the server answered an error: ${text}${code}")
+        },
+        Option.None => match (json.member(reply, "result")) {
+            Option.Some(r) => Result.Ok(r),
+            Option.None => Result.Err("the reply has neither \"result\" nor \"error\""),
+        },
+    }
+}
+
+/// The text of a `tools/call` result: its `content` blocks joined, text ones verbatim and
+/// the rest summarised (`[image 12 KiB]`). `isError: true` comes back as Err so it takes
+/// the same "error to the model, never a panic" path the builtins use.
+pub fn flatten(result: Json) -> Result<string, string> {
+    var parts: [string] = [];
+    match (json.get_array(result, "content")) {
+        Option.Some(blocks) => {
+            for block in blocks {
+                let kind = match (json.get_string(block, "type")) {
+                    Option.Some(t) => t,
+                    Option.None => "unknown",
+                };
+                if (kind == "text") {
+                    match (json.get_string(block, "text")) {
+                        Option.Some(t) => parts.push(t),
+                        Option.None => { },
+                    }
+                } else {
+                    let size = match (json.get_string(block, "data")) {
+                        Option.Some(d) => " ${d.len() * 3 / 4 / 1024} KiB",
+                        Option.None => "",
+                    };
+                    parts.push("[${kind}${size}]");
+                }
+            }
+        },
+        Option.None => match (json.member(result, "structuredContent")) {
+            Option.Some(s) => parts.push(json.stringify(s)),
+            Option.None => { },
+        },
+    }
+    let text = parts.join("\n");
+    let failed = match (json.get_bool(result, "isError")) {
+        Option.Some(f) => f,
+        Option.None => false,
+    };
+    if (failed) {
+        Result.Err(if (text.trim() == "") { "the tool reported an error" } else { text })
+    } else {
+        Result.Ok(text)
+    }
+}
+
+/// The tools a `tools/list` result declares. A tool without a schema gets an empty
+/// object schema, which every provider accepts.
+pub fn parse_tools(result: Json) -> Result<[RemoteTool], string> {
+    let items = match (json.get_array(result, "tools")) {
+        Option.Some(t) => t,
+        Option.None => {
+            return Result.Err("the reply to tools/list has no \"tools\" list");
+        },
+    };
+    var tools: [RemoteTool] = [];
+    for item in items {
+        let name = match (json.get_string(item, "name")) {
+            Option.Some(n) => n,
+            Option.None => {
+                return Result.Err("a tool in tools/list has no name");
+            },
+        };
+        let description = match (json.get_string(item, "description")) {
+            Option.Some(d) => d,
+            Option.None => "",
+        };
+        let schema = match (json.member(item, "inputSchema")) {
+            Option.Some(s) => s,
+            Option.None => obj(["type", "properties"], [jstr("object"), empty_object()]),
+        };
+        tools.push(RemoteTool { name: name, description: description, schema: schema });
+    }
+    Result.Ok(tools)
+}
+
+/// The batch size check: an Err naming the biggest argument when `params` would push the
+/// stdin batch over the limit the synchronous pipe write can take.
+pub fn check_size(text: string, arguments: Json) -> Result<int, string> {
+    if (text.len() <= MAX_BATCH) {
+        return Result.Ok(text.len());
+    }
+    var culprit = "";
+    var biggest = 0;
+    match (arguments) {
+        Json.JObject(m) => {
+            for k in m.keys() {
+                match (get(m, k)) {
+                    Option.Some(v) => {
+                        let size = json.stringify(v).len();
+                        if (size > biggest) {
+                            biggest = size;
+                            culprit = k;
+                        }
+                    },
+                    Option.None => { },
+                }
+            }
+        },
+        _ => { },
+    }
+    let hint = if (culprit == "") { "" } else { "; the argument '${culprit}' alone is ${biggest} bytes" };
+    Result.Err(
+        "the request is ${text.len()} bytes, over the ${MAX_BATCH}-byte limit of the stdio transport${hint}"
+    )
+}
+
+// ---------------------------------------------------------------- transporte
+
+// El estado de salida como texto. Función aparte por lo mismo que en `tools`: el
+// transpilador nativo no tipa este `match` junto al del drenado.
+fn exit_label(code: process.Exit) -> string {
+    match (code) {
+        process.Exit.Code(c) => "exit ${c}",
+        process.Exit.Signal(s) => "signal ${s}",
+    }
+}
+
+// Lo que un canal de salida produjo, entero (acotado en `MAX_STDERR` para stderr).
+fn drain(channel: Channel<bytes>, cap: int) -> bytes {
+    var captured = b"";
+    var draining = true;
+    while (draining) {
+        match (recv(channel)) {
+            Option.Some(chunk) => {
+                if (cap <= 0 || captured.len() < cap) {
+                    captured = captured + chunk;
+                }
+            },
+            Option.None => {
+                draining = false;
+            },
+        }
+    }
+    captured
+}
+
+// Una tirada completa: lanza el servidor, le entrega el lote, drena stdout y stderr y
+// devuelve la respuesta con la `id` pedida. Se lanza en STREAMING —como `run_command`—
+// porque drenar el canal aparca la fibra y deja vivo el indicador, mientras que `run()`
+// congelaría el planificador. El plazo se compone a mano: fibra guardiana + `kill`.
+fn exchange(s: Server, method: string, params: Json, timeout_ms: int) -> Result<Json, string> {
+    let text = batch(method, params);
+    check_size(text, params)?;
+    var command = process.cmd(s.command, s.args).stdin(text.to_bytes());
+    command = command.dir(if (s.dir.trim() == "") { ui.workspace() } else { ui.resolve_path(s.dir) });
+    for k in s.env.keys() {
+        match (get(s.env, k)) {
+            Option.Some(v) => {
+                command = command.env(k, v);
+            },
+            Option.None => { },
+        }
+    }
+    let p = match (command.stream()) {
+        Result.Ok(proc) => proc,
+        Result.Err(e) => {
+            return Result.Err("cannot start '${s.command}': ${e}");
+        },
+    };
+    let started = time.monotonic();
+    spawn(fn() {
+        time.sleep(timeout_ms);
+        p.kill(true);
+    });
+    // stderr se drena en su propia fibra: si el servidor escribe mucho por ahí y nadie
+    // lee, el canal acotado se llena y el hijo se bloquea sin llegar a contestar.
+    let errors: Channel<bytes> = Channel.new();
+    spawn(fn() {
+        send(errors, drain(p.err, MAX_STDERR));
+    });
+    let out = drain(p.out, 0);
+    let elapsed = time.monotonic() - started;
+    let status = exit_label(p.wait());
+    let stderr = match (recv(errors)) {
+        Option.Some(b) => match (from_utf8(b)) {
+            Result.Ok(t) => t.trim(),
+            Result.Err(_) => "",
+        },
+        Option.None => "",
+    };
+    let output = match (from_utf8(out)) {
+        Result.Ok(t) => t,
+        Result.Err(_) => {
+            return Result.Err("the server wrote non-UTF-8 output");
+        },
+    };
+    match (pick(output, REQUEST_ID)) {
+        Option.Some(reply) => result_of(reply),
+        Option.None => {
+            let why = if (elapsed >= timeout_ms) {
+                "timed out after ${timeout_ms}ms"
+            } else {
+                "no reply to ${method} (${status})"
+            };
+            let detail = if (stderr == "") { "" } else { "\n" + ui.clip(stderr, MAX_STDERR) };
+            Result.Err("${s.command}: ${why}${detail}")
+        },
+    }
+}
+
+/// `initialize` + `tools/list` against `s`. On failure the server is marked unavailable
+/// with the reason in `note`; on success `note` is cleared and `tool_count` set.
+pub fn discover(s: Server, timeout_ms: int) -> Result<[RemoteTool], string> {
+    if (!s.enabled) {
+        return Result.Ok([]);
+    }
+    let outcome: Result<[RemoteTool], string> = match (exchange(
+        s,
+        "tools/list",
+        empty_object(),
+        timeout_ms
+    )) {
+        Result.Ok(result) => parse_tools(result),
+        Result.Err(e) => Result.Err(e),
+    };
+    match (outcome) {
+        Result.Ok(tools) => {
+            s.note = "";
+            s.tool_count = tools.len();
+        },
+        Result.Err(e) => {
+            s.enabled = false;
+            s.note = e;
+            s.tool_count = 0;
+        },
+    }
+    outcome
+}
+
+/// `tools/call` of `tool` (the raw server-side name) with the parsed `arguments`.
+pub fn call(s: Server, tool: string, arguments: Json, timeout_ms: int) -> Result<string, string> {
+    let params = obj(["name", "arguments"], [jstr(tool), arguments]);
+    let result = exchange(s, "tools/call", params, timeout_ms)?;
+    flatten(result)
+}
+
+/// One line describing how the server is launched, for the banner and `/mcp`.
+pub fn command_line(s: Server) -> string {
+    if (s.args.len() == 0) { s.command } else { s.command + " " + s.args.join(" ") }
+}

@@ -24,6 +24,9 @@ pub struct Config {
     stream: bool,
     verbose: bool,
     prompt: string,
+    mcp_enabled: bool,
+    mcp_config: string,
+    help: bool,
 }
 
 /// The protocol name, for the banner.
@@ -77,7 +80,10 @@ fn preset(profile: string) -> Result<Config, string> {
         allow_exec: false,
         stream: env_or("RAYCODE_STREAM", "on") != "off",
         verbose: false,
-        prompt: ""
+        prompt: "",
+        mcp_enabled: env_or("RAYCODE_MCP", "on") != "off",
+        mcp_config: env_or("RAYCODE_MCP_CONFIG", ""),
+        help: false
     };
     if (profile == "llama" || profile == "local") {
         base.api = Api.OpenAI;
@@ -166,9 +172,19 @@ pub fn load(argv: [string]) -> Result<Config, string> {
         } else if (a == "--allow-exec") {
             cfg.allow_exec = true;
             i = i + 1;
+        } else if (a == "--mcp-config") {
+            cfg.mcp_config = value_of(argv, i, a)?;
+            i = i + 2;
+        } else if (a == "--no-mcp") {
+            cfg.mcp_enabled = false;
+            i = i + 1;
         } else if (a == "--verbose" || a == "-v") {
             cfg.verbose = true;
             i = i + 1;
+        } else if (a == "--help" || a == "-h") {
+            // Pedir ayuda no es arrancar: se sale antes de exigir modelo ni nada más.
+            cfg.help = true;
+            return Result.Ok(cfg);
         } else if (a.starts_with("-")) {
             return Result.Err("unknown flag '${a}'");
         } else {

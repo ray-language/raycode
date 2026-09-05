@@ -12,7 +12,15 @@ import src/client;
 import std/time;
 import std/fs;
 import src/render;
+import src/mcp;
+import std/json;
+import std/process;
 from src/config import Api;
+
+fn no_servers() -> [mcp.Server] {
+    let none: [mcp.Server] = [];
+    none
+}
 
 fn base_config(profile: string) -> config.Config {
     match (config.load(["-p", profile, "-m", "test-model", "-u", "http://localhost:9999"])) {
@@ -42,6 +50,22 @@ fn an_unknown_flag_is_rejected() {
     match (config.load(["--nope"])) {
         Result.Ok(_) => panic("expected an error"),
         Result.Err(e) => assert(e.contains("--nope")),
+    }
+}
+
+@test
+fn help_wins_over_a_missing_model() {
+    match (config.load(["--help"])) {
+        Result.Ok(c) => assert(c.help),
+        Result.Err(e) => panic(e),
+    }
+    match (config.load(["-m", "m", "-h"])) {
+        Result.Ok(c) => assert(c.help),
+        Result.Err(e) => panic(e),
+    }
+    match (config.load(["-m", "m"])) {
+        Result.Ok(c) => assert(!c.help),
+        Result.Err(e) => panic(e),
     }
 }
 
@@ -120,10 +144,12 @@ fn anthropic_assistant_blocks_are_replayed_verbatim() {
 @test
 fn tool_failures_come_back_as_text() {
     let reg = tools.registry(false);
-    assert(tools.execute(reg, "nope", "{}").contains("unknown tool"));
-    assert(tools.execute(reg, "read_file", "not json").contains("not valid JSON"));
-    assert(tools.execute(reg, "read_file", "{}").contains("missing required string"));
-    assert(tools.execute(reg, "read_file", `{"path":"/nonexistent/x"}`).starts_with("error:"));
+    assert(tools.execute(reg, no_servers(), "nope", "{}").contains("unknown tool"));
+    assert(tools.execute(reg, no_servers(), "read_file", "not json").contains("not valid JSON"));
+    assert(tools.execute(reg, no_servers(), "read_file", "{}").contains("missing required string"));
+    assert(tools
+        .execute(reg, no_servers(), "read_file", `{"path":"/nonexistent/x"}`)
+        .starts_with("error:"));
 }
 
 @test
@@ -134,7 +160,7 @@ fn the_shell_tool_is_opt_in() {
     assert(!tools.offers(tools.registry(false), "run_command"));
     // Y sin `--allow-exec` no se ejecuta aunque el modelo lo pida por su nombre.
     assert(tools
-        .execute(tools.registry(false), "run_command", `{"command":"echo no"}`)
+        .execute(tools.registry(false), no_servers(), "run_command", `{"command":"echo no"}`)
         .contains("unknown tool"));
 }
 
@@ -251,7 +277,7 @@ fn the_usage_line_reports_tokens_requests_and_speed() {
 @test
 fn the_shell_tool_returns_the_command_output() {
     let reg = tools.registry(true);
-    let out = tools.execute(reg, "run_command", `{"command":"echo hola-raycode"}`);
+    let out = tools.execute(reg, no_servers(), "run_command", `{"command":"echo hola-raycode"}`);
     assert(out.contains("hola-raycode"));
     assert(out.contains("exit 0"));
 }
@@ -278,6 +304,7 @@ fn the_shell_tool_honours_its_timeout() {
     let started = time.monotonic();
     let out = tools.execute(
         reg,
+        no_servers(),
         "run_command",
         `{"command":"echo antes; sleep 5; echo despues","timeout_ms":800}`
     );
@@ -569,7 +596,12 @@ fn reading_a_huge_file_stays_bounded() {
         Result.Err(e) => panic(e),
     }
     let reg = tools.registry(false);
-    let out = tools.execute(reg, "read_file", `{"path":"/tmp/raycode_huge.txt","max_lines":5}`);
+    let out = tools.execute(
+        reg,
+        no_servers(),
+        "read_file",
+        `{"path":"/tmp/raycode_huge.txt","max_lines":5}`
+    );
     assert(out.contains("1: 0123456789"));
     assert(out.contains("were read"));
     let _ = fs.remove_file(path);
@@ -585,5 +617,219 @@ fn paths_resolve_against_the_workspace() {
     assert_eq(ui.resolve_path("/etc/hosts"), "/etc/hosts");
     // Y las herramientas siguen leyendo del directorio actual.
     let reg = tools.registry(false);
-    assert(tools.execute(reg, "read_file", `{"path":"ray.toml"}`).contains("raycode"));
+    assert(tools
+        .execute(reg, no_servers(), "read_file", `{"path":"ray.toml"}`)
+        .contains("raycode"));
+}
+
+// ---------------------------------------------------------------- mcp
+
+@test
+fn mcp_names_round_trip() {
+    assert_eq(mcp.tool_name("raylang", "ray_check"), "mcp__raylang__ray_check");
+    match (mcp.split_name("mcp__raylang__ray_check")) {
+        Option.Some(pair) => {
+            assert_eq(pair.0, "raylang");
+            assert_eq(pair.1, "ray_check");
+        },
+        Option.None => panic("expected a server and a tool"),
+    }
+    // El nombre de la herramienta puede llevar '__' a su vez: el corte es el primero.
+    match (mcp.split_name("mcp__s__a__b")) {
+        Option.Some(pair) => {
+            assert_eq(pair.0, "s");
+            assert_eq(pair.1, "a__b");
+        },
+        Option.None => panic("expected a split"),
+    }
+    assert(!mcp.is_remote("read_file"));
+    match (mcp.split_name("mcp__broken")) {
+        Option.Some(_) => panic("expected None"),
+        Option.None => { },
+    }
+}
+
+@test
+fn mcp_config_follows_the_standard_envelope() {
+    let text = `{"mcpServers":{"zeta":{"command":"z","disabled":true},"raylang":{"command":"ray","args":["mcp"],"env":{"RAY_LOG":"1"},"dir":"sub"}}}`;
+    match (mcp.parse_config(text)) {
+        Result.Err(e) => panic(e),
+        Result.Ok(servers) => {
+            assert_eq(servers.len(), 2);
+            // Ordenados por nombre, para que el catálogo sea estable entre arranques.
+            assert_eq(servers[0].name, "raylang");
+            assert_eq(servers[0].command, "ray");
+            assert_eq(servers[0].args, ["mcp"]);
+            assert_eq(servers[0].dir, "sub");
+            match (get(servers[0].env, "RAY_LOG")) {
+                Option.Some(v) => assert_eq(v, "1"),
+                Option.None => panic("expected RAY_LOG in env"),
+            }
+            assert(servers[0].enabled);
+            assert_eq(servers[1].name, "zeta");
+            assert(!servers[1].enabled);
+            assert_eq(mcp.command_line(servers[0]), "ray mcp");
+        },
+    }
+    match (mcp.parse_config(`{"mcpServers":{"bad__name":{"command":"x"}}}`)) {
+        Result.Ok(_) => panic("expected an error"),
+        Result.Err(e) => assert(e.contains("bad__name")),
+    }
+    match (mcp.parse_config(`{"mcpServers":{"x":{"args":["a"]}}}`)) {
+        Result.Ok(_) => panic("expected an error"),
+        Result.Err(e) => assert(e.contains("command")),
+    }
+    match (mcp.parse_config(`{"servers":{}}`)) {
+        Result.Ok(_) => panic("expected an error"),
+        Result.Err(e) => assert(e.contains("mcpServers")),
+    }
+}
+
+@test
+fn mcp_batch_carries_the_handshake_and_the_request() {
+    let params = match (json.parse(`{"name":"ray_fmt","arguments":{"code":"fn main() {}"}}`)) {
+        Result.Ok(j) => j,
+        Result.Err(e) => panic(e),
+    };
+    let lines = mcp.batch("tools/call", params).trim().split("\n");
+    assert_eq(lines.len(), 3);
+    assert(lines[0].contains("\"method\":\"initialize\""));
+    assert(lines[0].contains("\"id\":1"));
+    assert(lines[0].contains(mcp.PROTOCOL_VERSION));
+    assert(lines[1].contains("notifications/initialized"));
+    assert(!lines[1].contains("\"id\""));
+    assert(lines[2].contains("\"id\":2"));
+    assert(lines[2].contains("\"name\":\"ray_fmt\""));
+}
+
+@test
+fn mcp_pick_selects_the_reply_by_id_and_skips_noise() {
+    let output = "starting up\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}\n";
+    match (mcp.pick(output, 2)) {
+        Option.Some(j) => match (json.member(j, "result")) {
+            Option.Some(_) => { },
+            Option.None => panic("expected a result"),
+        },
+        Option.None => panic("expected the reply with id 2"),
+    }
+    match (mcp.pick(output, 7)) {
+        Option.Some(_) => panic("expected None"),
+        Option.None => { },
+    }
+}
+
+@test
+fn mcp_flatten_joins_text_and_turns_is_error_into_err() {
+    let ok = match (json.parse(
+        `{"content":[{"type":"text","text":"a"},{"type":"image","data":"AAAA","mimeType":"image/png"},{"type":"text","text":"b"}],"isError":false}`
+    )) {
+        Result.Ok(j) => j,
+        Result.Err(e) => panic(e),
+    };
+    match (mcp.flatten(ok)) {
+        Result.Ok(text) => assert_eq(text, "a\n[image 0 KiB]\nb"),
+        Result.Err(e) => panic(e),
+    }
+    let failed = match (json.parse(`{"content":[{"type":"text","text":"boom"}],"isError":true}`)) {
+        Result.Ok(j) => j,
+        Result.Err(e) => panic(e),
+    };
+    match (mcp.flatten(failed)) {
+        Result.Ok(_) => panic("expected an error"),
+        Result.Err(e) => assert_eq(e, "boom"),
+    }
+}
+
+@test
+fn mcp_tools_list_becomes_remote_tools() {
+    let result = match (json.parse(
+        `{"tools":[{"name":"a","description":"A","inputSchema":{"type":"object","properties":{"x":{"type":"string"}}}},{"name":"b"}]}`
+    )) {
+        Result.Ok(j) => j,
+        Result.Err(e) => panic(e),
+    };
+    match (mcp.parse_tools(result)) {
+        Result.Err(e) => panic(e),
+        Result.Ok(remote) => {
+            assert_eq(remote.len(), 2);
+            assert_eq(remote[0].name, "a");
+            assert_eq(remote[0].description, "A");
+            assert(json.stringify(remote[0].schema).contains("\"x\""));
+            assert_eq(remote[1].description, "");
+            assert(json.stringify(remote[1].schema).contains("\"type\":\"object\""));
+        },
+    }
+}
+
+@test
+fn mcp_batches_over_the_pipe_limit_are_rejected_naming_the_argument() {
+    let big = "x".repeat(70000);
+    let params = match (json.parse(`{"name":"t","arguments":{"small":"1","code":"${big}"}}`)) {
+        Result.Ok(j) => j,
+        Result.Err(e) => panic(e),
+    };
+    let arguments = match (json.member(params, "arguments")) {
+        Option.Some(a) => a,
+        Option.None => panic("no arguments"),
+    };
+    match (mcp.check_size(mcp.batch("tools/call", params), arguments)) {
+        Result.Ok(_) => panic("expected a rejection"),
+        Result.Err(e) => {
+            assert(e.contains("over the"));
+            assert(e.contains("'code'"));
+        },
+    }
+}
+
+@test
+fn mcp_remote_tools_enter_the_catalogue_and_dispatch() {
+    // De punta a punta contra `ray mcp`; se salta si el binario no está en el PATH.
+    match (process.run("ray", ["--version"])) {
+        Result.Err(_) => {
+            return;
+        },
+        Result.Ok(_) => { },
+    }
+    let servers = match (mcp.parse_config(
+        `{"mcpServers":{"raylang":{"command":"ray","args":["mcp"]}}}`
+    )) {
+        Result.Ok(s) => s,
+        Result.Err(e) => panic(e),
+    };
+    let catalogue = tools.from_servers(servers);
+    assert(servers[0].enabled);
+    assert_eq(servers[0].note, "");
+    assert_eq(servers[0].tool_count, catalogue.len());
+    assert(tools.offers(catalogue, "mcp__raylang__ray_check"));
+    assert_eq(catalogue[0].source, "raylang");
+    let verdict = tools.execute(
+        catalogue,
+        servers,
+        "mcp__raylang__ray_check",
+        `{"code":"fn main() { let x: int = \\"a\\"; }"}`
+    );
+    assert(verdict.contains("type error"));
+    let fine = tools.execute(
+        catalogue,
+        servers,
+        "mcp__raylang__ray_check",
+        `{"code":"fn main() {}"}`
+    );
+    assert(fine.contains("ok"));
+}
+
+@test
+fn mcp_a_server_that_cannot_start_is_marked_not_fatal() {
+    let servers = match (mcp.parse_config(
+        `{"mcpServers":{"ghost":{"command":"/nonexistent/mcp-server"}}}`
+    )) {
+        Result.Ok(s) => s,
+        Result.Err(e) => panic(e),
+    };
+    let catalogue = tools.from_servers(servers);
+    assert_eq(catalogue.len(), 0);
+    assert(!servers[0].enabled);
+    assert(servers[0].note.contains("cannot start"));
+    let answer = tools.execute(catalogue, servers, "mcp__ghost__x", "{}");
+    assert(answer.contains("unknown tool"));
 }

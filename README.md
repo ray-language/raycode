@@ -95,13 +95,15 @@ ray run main.ray -p anthropic                      # API de Anthropic
 ray run main.ray -p openai -m gpt-4o-mini          # API de OpenAI
 ray run main.ray --allow-exec "resume este repo"   # una sola petición, con shell
 ray test                                           # las pruebas del harness
+raycode --help                                     # banderas, entorno y ejemplos
 ```
 
 Un turno del usuario dispara un bucle de herramientas hasta que el modelo responde;
 cada petición se cronometra y se contabiliza. El binario no necesita nada alrededor
 —ni el proyecto, ni las dependencias, ni el intérprete— y trabaja sobre el directorio
 desde el que se invoca, que es lo que se quiere de un agente: `read_file`,
-`write_file`, `list_dir`, `run_command` y el Tab operan ahí.
+`write_file`, `list_dir`, `run_command` y el Tab operan ahí. Con un `.raycode/mcp.json`
+se suman las herramientas de cualquier [servidor MCP](#servidores-mcp).
 
 ## Qué hace
 
@@ -226,7 +228,9 @@ escritura por adelantado.
 | `/usage` | tokens, peticiones y latencia de la sesión |
 | `/model` | el modelo en uso y el catálogo del endpoint (`GET /v1/models`), con el actual marcado |
 | `/model <id>` | cambia de modelo en caliente, conservando la conversación |
-| `/tools` | las herramientas expuestas al modelo |
+| `/tools` | las herramientas expuestas al modelo, con su origen |
+| `/mcp` | los servidores MCP: mandato, herramientas y último error |
+| `/mcp reload` | vuelve a descubrir los servidores MCP, conservando la conversación |
 | `/set [clave valor]` | mandos en caliente: `max-tokens`, `temperature`, `max-steps`, `timeout-ms` (sin argumentos, los muestra junto a `stream`) |
 | `/system <texto>` | reemplaza el prompt de sistema (vacío: lo muestra) |
 | `/reset` | olvida la conversación, conserva los totales |
@@ -234,17 +238,76 @@ escritura por adelantado.
 | `/exit` (o `/quit`) | salir (igual que Ctrl-D) |
 | `ESC` | detiene el turno en marcha (el modelo o su herramienta) |
 
+## Servidores MCP
+
+Las herramientas de un servidor [MCP](https://modelcontextprotocol.io) entran en el
+catálogo junto a `read_file` y compañía, sin que el bucle del agente distinga unas de
+otras. Se declaran en `.raycode/mcp.json` del espacio de trabajo (o, si no existe, en
+`~/.raycode/mcp.json`) con el mismo sobre que Claude Code y Claude Desktop, así que un
+bloque se puede copiar tal cual:
+
+```json
+{
+  "mcpServers": {
+    "raylang": { "command": "ray", "args": ["mcp"] }
+  }
+}
+```
+
+Campos por servidor: `command`, `args`, `env`, `dir` (relativo al espacio de trabajo)
+y `disabled`. Cada herramienta se expone al modelo como `mcp__<servidor>__<tool>`
+—`mcp__raylang__ray_check`—, así que no hay colisiones y el origen se lee en la traza.
+
+```
+tools    read_file, write_file, list_dir
+         run_command is off; start with --allow-exec to enable the shell
+mcp      raylang · ray mcp · 5 tools
+```
+
+**Opt-in por construcción**: sin archivo no hay servidores. Un servidor MCP es un
+programa arbitrario que se lanza en nombre del usuario, y por eso el banner dice cuál,
+con qué mandato y qué aportó. Un servidor que no arranca, que tarda más de 5 s o que
+contesta basura no tumba nada: se marca en rojo con la causa, la sesión sigue con el
+resto y `/mcp reload` lo reintenta sin perder la conversación.
+
+El transporte es **stdio, un proceso por llamada**: cada `tools/list` y cada `tools/call`
+lanza el servidor, le manda por stdin el apretón de manos (`initialize`, `initialized`)
+y la petición en un solo lote, drena su salida y se queda con la respuesta. Es lo que
+hace que el catálogo funcione con cualquier servidor stdio, con dos consecuencias que
+conviene saber: solo sirven servidores **sin estado entre llamadas** (`ray mcp` lo es,
+y cuesta unos 5 ms por llamada), y el coste de arranque se paga en cada uso (trivial
+para `ray mcp`, cerca de un segundo para un servidor de `npx`). Una petición de más de
+60 KiB se rechaza con un error que dice qué argumento se pasó de tamaño, antes de que
+la escritura síncrona al pipe pueda clavar la VM. Una llamada tiene 60 s; después se
+mata el proceso y el modelo recibe el error. Los resultados llegan al modelo como texto:
+los bloques `text` tal cual, los demás resumidos (`[image 12 KiB]`), y `isError` por el
+mismo camino que cualquier fallo de herramienta —error legible, nunca un panic.
+
+Con `ray mcp` el bucle es el de escribir raylang y verificarlo en el mismo turno:
+
+```
+› escribe en fib.ray una función fib(n) y comprueba que compila
+⚙ write_file {"path":"fib.ray","content":"fn fib(n: int) -> int { ..."}
+  │ wrote 118 bytes to fib.ray
+⚙ mcp__raylang__ray_check {"path":"fib.ray"}
+  │ exit: 0
+  │ ok: 'fib.ray' compiles
+```
+
+Banderas: `--mcp-config <ruta>` fuerza un archivo concreto y `--no-mcp` apaga todo;
+entorno: `RAYCODE_MCP_CONFIG` y `RAYCODE_MCP=off`.
+
 ## Configuración
 
 Banderas: `-p/--provider`, `-u/--base-url`, `-m/--model`, `-k/--api-key`,
 `-s/--system`, `--max-tokens`, `-t/--temperature`, `--timeout-ms`, `--max-steps`,
-`--no-stream`, `--allow-exec`, `-v/--verbose`. Lo que sobre en la línea de órdenes es
-la petición de un solo turno.
+`--no-stream`, `--allow-exec`, `--mcp-config`, `--no-mcp`, `-v/--verbose`,
+`-h/--help`. Lo que sobre en la línea de órdenes es la petición de un solo turno.
 
 Entorno: `RAYCODE_PROFILE`, `RAYCODE_BASE_URL`, `RAYCODE_MODEL`, `RAYCODE_API_KEY`,
 `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `RAYCODE_SYSTEM`, `RAYCODE_MAX_TOKENS`,
 `RAYCODE_TEMPERATURE`, `RAYCODE_MAX_STEPS`, `RAYCODE_TIMEOUT_MS`, `RAYCODE_STREAM`,
-`NO_COLOR` (o `RAYCODE_NO_COLOR`).
+`RAYCODE_MCP_CONFIG`, `RAYCODE_MCP`, `NO_COLOR` (o `RAYCODE_NO_COLOR`).
 
 ## Estructura
 
@@ -262,10 +325,11 @@ Entorno: `RAYCODE_PROFILE`, `RAYCODE_BASE_URL`, `RAYCODE_MODEL`, `RAYCODE_API_KE
 | `src/anthropic.ray` | adaptador `/v1/messages` |
 | `src/client.ray` | transporte HTTP, cronometraje y sondeo del modelo |
 | `src/tools.ray` | catálogo de herramientas y su ejecución protegida |
+| `src/mcp.ray` | cliente MCP por stdio: configuración, apretón de manos, `tools/list` y `tools/call` |
 | `src/agent.ray` | el bucle: pedir → ejecutar herramientas → repetir |
 | `src/usage.ray` | contabilidad de tokens, peticiones y latencia |
 | `src/ui.ray` | color ANSI y formateadores de terminal |
-| `tests/harness_test.ray` | pruebas de configuración, protocolos y contabilidad |
+| `tests/harness_test.ray` | pruebas de configuración, protocolos, contabilidad y MCP |
 | `install.sh` | instalador del binario desde la GitHub Release |
 | `.github/workflows/release.yml` | compila y publica los binarios al empujar un tag `v*` |
 

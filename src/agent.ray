@@ -12,6 +12,8 @@ from src/message import Message, ToolCall, Reply;
 import src/message;
 from src/tools import Tool;
 import src/tools;
+from src/mcp import Server;
+import src/mcp;
 from src/usage import Usage;
 import src/usage;
 import src/client;
@@ -40,6 +42,7 @@ const KEY_INTERRUPT: int = 3;
 pub struct Session {
     config: Config,
     tools: [Tool],
+    mcp: [Server],
     history: [Message],
     total: Usage,
     turns: int,
@@ -53,17 +56,35 @@ enum Step {
     Cancelled,
 }
 
-/// An empty session for `c`, with the tool registry its configuration allows.
-pub fn open(c: Config) -> Session {
+/// An empty session for `c`, with the tool registry its configuration allows and the
+/// tools of every configured MCP server. Only an unusable `mcp.json` is an error: a
+/// server that fails to answer is marked and skipped.
+pub fn open(c: Config) -> Result<Session, string> {
     let empty: [Message] = [];
-    Session {
+    let servers: [Server] = if (c.mcp_enabled) { mcp.load(c.mcp_config)? } else { [] };
+    let s = Session {
         config: c,
-        tools: tools.registry(c.allow_exec),
+        tools: [],
+        mcp: servers,
         history: empty,
         total: usage.zero(),
         turns: 0,
         steps: 0
+    };
+    reconnect(s);
+    Result.Ok(s)
+}
+
+/// Rebuilds the catalogue: the builtins plus a fresh discovery against every MCP server
+/// (a server that had failed gets another chance). The transcript is kept.
+pub fn reconnect(s: Session) {
+    for server in s.mcp {
+        // Un servidor apagado por configuración sigue apagado; uno caído se reintenta.
+        if (!server.enabled && server.note != "disabled in the configuration") {
+            server.enabled = true;
+        }
     }
+    s.tools = tools.registry(s.config.allow_exec) + tools.from_servers(s.mcp);
 }
 
 /// Forgets the transcript (the configuration and the accumulated usage stay).
@@ -238,7 +259,7 @@ fn call_tool(s: Session, call: ToolCall, watch: bool) -> Option<string> {
     let box: Channel<string> = Channel.new();
     spawn(fn() {
         let guarded = try_call(fn() -> string {
-            tools.execute(s.tools, call.name, call.arguments)
+            tools.execute(s.tools, s.mcp, call.name, call.arguments)
         });
         let result = match (guarded) {
             Result.Ok(text) => text,

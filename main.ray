@@ -9,7 +9,7 @@
 //
 // Variables de entorno: RAYCODE_PROFILE, RAYCODE_BASE_URL, RAYCODE_MODEL, RAYCODE_API_KEY,
 // ANTHROPIC_API_KEY, OPENAI_API_KEY, RAYCODE_SYSTEM, RAYCODE_MAX_TOKENS, RAYCODE_TEMPERATURE,
-// RAYCODE_MAX_STEPS, RAYCODE_TIMEOUT_MS, NO_COLOR.
+// RAYCODE_MAX_STEPS, RAYCODE_TIMEOUT_MS, RAYCODE_MCP_CONFIG, RAYCODE_MCP, NO_COLOR.
 from src/config import Config;
 import src/config;
 import src/agent;
@@ -17,6 +17,7 @@ import src/client;
 import src/usage;
 import src/lineedit;
 import src/ui;
+import src/mcp;
 
 // La cabecera: qué modelo, contra qué endpoint, con qué herramientas. Lo que el endpoint
 // declare sobre el modelo cargado se muestra junto a lo configurado.
@@ -49,15 +50,56 @@ fn banner(s: agent.Session) {
     }
     var names: [string] = [];
     for t in s.tools {
-        names.push(t.name);
+        if (t.source == "") {
+            names.push(t.name);
+        }
     }
     print(ui.dim("tools    ") + names.join(", "));
     if (!c.allow_exec) {
         print(ui.dim("         run_command is off; start with --allow-exec to enable the shell"));
     }
+    // Un servidor MCP es un programa arbitrario lanzado en nombre del usuario: el banner
+    // dice cuál, con qué mandato y qué aportó, igual que dice si el shell está apagado.
+    for server in s.mcp {
+        print(ui.dim("mcp      ") + mcp_summary(server));
+    }
     print(ui.rule(64));
     print(ui.dim("/help for commands · Ctrl-D to quit"));
     print("");
+}
+
+// Un servidor MCP en una línea: nombre, mandato y estado.
+fn mcp_summary(server: mcp.Server) -> string {
+    let launch = ui.dim(" · " + mcp.command_line(server));
+    if (server.enabled) {
+        let count = if (server.tool_count == 1) { "1 tool" } else { "${server.tool_count} tools" };
+        ui.bold(server.name) + launch + ui.dim(" · ${count}")
+    } else {
+        ui.bold(server.name) + launch + " " + ui.red("✗ " + ui.clip(server.note, 120))
+    }
+}
+
+// Los servidores MCP con sus herramientas y su último error.
+fn show_mcp(s: agent.Session) {
+    print(ui.bold("mcp") + ui.dim(" · /mcp reload to rediscover"));
+    if (s.mcp.len() == 0) {
+        let where = match (mcp.config_path(s.config.mcp_config)) {
+            Option.Some(p) => p,
+            Option.None => ".raycode/mcp.json or ~/.raycode/mcp.json",
+        };
+        let why = if (s.config.mcp_enabled) { "no servers configured (${where})" } else { "disabled with --no-mcp" };
+        print(ui.dim("  ${why}"));
+        return;
+    }
+    for server in s.mcp {
+        print("  " + mcp_summary(server));
+        for t in s.tools {
+            if (t.source == server.name) {
+                print("    " + t.name);
+                print(ui.dim(ui.indent(ui.clip(t.description, 300), "      ")));
+            }
+        }
+    }
 }
 
 // Lo que Tab completa en primera posición.
@@ -68,6 +110,7 @@ fn commands() -> [string] {
         "/model",
         "/set",
         "/tools",
+        "/mcp",
         "/system",
         "/reset",
         "/verbose",
@@ -83,6 +126,7 @@ fn help() {
     print("  /model [<id>]      the current model and the endpoint's catalogue; switch with an id");
     print("  /set [k v]         knobs: max-tokens, temperature, max-steps, timeout-ms, stream");
     print("  /tools             the tools exposed to the model");
+    print("  /mcp [reload]      the MCP servers, their tools and errors; reload rediscovers them");
     print("  /system <text>     replace the system prompt (empty: show it)");
     print("  /reset             forget the transcript, keep the session totals");
     print("  /verbose           toggle request/response tracing on stderr");
@@ -215,8 +259,9 @@ fn apply_setting(s: agent.Session, key: string, value: string) {
 fn show_tools(s: agent.Session) {
     print(ui.bold("tools"));
     for t in s.tools {
-        print("  " + ui.bold(t.name));
-        print(ui.dim(ui.indent(t.description, "    ")));
+        let origin = if (t.source == "") { "" } else { ui.dim(" · mcp ${t.source}") };
+        print("  " + ui.bold(t.name) + origin);
+        print(ui.dim(ui.indent(ui.clip(t.description, 300), "    ")));
     }
 }
 
@@ -240,6 +285,12 @@ fn command(s: agent.Session, line: string) -> bool {
         }
     } else if (name == "/tools") {
         show_tools(s);
+    } else if (name == "/mcp") {
+        if (rest == "reload") {
+            agent.reconnect(s);
+            print(ui.dim("mcp servers rediscovered"));
+        }
+        show_mcp(s);
     } else if (name == "/model") {
         if (rest == "") {
             show_model(s);
@@ -307,46 +358,104 @@ fn repl(s: agent.Session, editor: lineedit.Editor) -> int {
     0
 }
 
+const USAGE_LINE: string = "usage: raycode [-p llama|openai|anthropic] [-m model] [-u base-url] [-k key] [--allow-exec] [--mcp-config file | --no-mcp] [prompt…]";
+
+// La ayuda de línea de órdenes (`--help`): banderas, entorno y órdenes del REPL.
+fn usage() {
+    print(
+        ui.bold(ui.magenta("raycode")) + ui.dim(" · a raylang harness for local and remote models")
+    );
+    print("");
+    print(USAGE_LINE);
+    print("");
+    print("Without a prompt raycode opens an interactive session; with one it answers");
+    print("once and exits. Tools operate on the current directory (the workspace).");
+    print("");
+    print(ui.bold("options"));
+    print(
+        "  -p, --provider <name>    llama (default, llama.cpp at 127.0.0.1:8080), openai, anthropic"
+    );
+    print("  -m, --model <id>         model id (default depends on the provider)");
+    print("  -u, --base-url <url>     endpoint base URL");
+    print("  -k, --api-key <key>      API key (or ANTHROPIC_API_KEY / OPENAI_API_KEY)");
+    print("  -s, --system <text>      system prompt");
+    print("      --max-tokens <n>     output token ceiling (default 4096)");
+    print("  -t, --temperature <x>    sampling temperature (default 0.2)");
+    print("      --max-steps <n>      tool calls per turn (default 12)");
+    print("      --timeout-ms <ms>    request timeout (default 600000)");
+    print("      --no-stream          wait for the whole answer instead of streaming it");
+    print("      --allow-exec         enable the run_command tool (shell access, off by default)");
+    print(
+        "      --mcp-config <file>  MCP servers file (default .raycode/mcp.json, then ~/.raycode/mcp.json)"
+    );
+    print("      --no-mcp             do not start any MCP server");
+    print("  -v, --verbose            trace requests and responses on stderr");
+    print("  -h, --help               this help");
+    print("");
+    print(ui.bold("environment"));
+    print("  RAYCODE_PROFILE, RAYCODE_BASE_URL, RAYCODE_MODEL, RAYCODE_API_KEY, RAYCODE_SYSTEM,");
+    print("  RAYCODE_MAX_TOKENS, RAYCODE_TEMPERATURE, RAYCODE_MAX_STEPS, RAYCODE_TIMEOUT_MS,");
+    print("  RAYCODE_STREAM=off, RAYCODE_MCP_CONFIG, RAYCODE_MCP=off, RAYCODE_WORKSPACE,");
+    print("  RAYCODE_HISTORY, ANTHROPIC_API_KEY, OPENAI_API_KEY, NO_COLOR");
+    print("");
+    print(ui.bold("examples"));
+    print("  raycode                                   chat with llama.cpp");
+    print("  raycode -p anthropic                      chat with the Anthropic API");
+    print("  raycode -p openai -m gpt-4o-mini          chat with OpenAI");
+    print("  raycode --allow-exec \"summarise this repo\"  one request, with the shell");
+    print("");
+    print(ui.dim("Inside the session, /help lists the commands."));
+}
+
 fn main() -> int {
-    match (config.load(
-    args()
-)) {
+    match (config.load(args())) {
         Result.Err(e) => {
             eprint(ui.red("raycode: ") + e);
-            eprint(
-                "usage: ray run main.ray [-p llama|openai|anthropic] [-m model] [-u base-url] [-k key] [--allow-exec] [prompt…]"
-            );
+            eprint(USAGE_LINE + ui.dim("  (--help for details)"));
             2
         },
-        Result.Ok(c) => {
-            let s = agent.open(c);
-            // Con una petición en la línea de órdenes el harness es de un solo turno.
-            if (c.prompt.trim() != "") {
-                match (agent.ask(s, c.prompt)) {
-                    Result.Ok(u) => {
-                        print(ui.usage_line(u));
-                        0
-                    },
-                    Result.Err(e) => {
-                        eprint(ui.red("✗ ") + e);
-                        1
-                    },
-                }
-            } else {
-                let editor = lineedit.open(lineedit.default_history_path());
-                // El modo crudo lo restaura `std/term` pase lo que pase (también al salir
-                // el proceso), así que aquí solo queda no perder el código de salida.
-                let guarded = try_call(fn() -> int {
-                    repl(s, editor)
-                });
-                match (guarded) {
-                    Result.Ok(code) => code,
-                    Result.Err(e) => {
-                        eprint(ui.red("raycode: ") + e);
-                        70
-                    },
-                }
+        Result.Ok(c) => if (c.help) {
+            usage();
+            0
+        } else {
+            match (agent.open(c)) {
+                Result.Err(e) => {
+                    eprint(ui.red("raycode: ") + e);
+                    2
+                },
+                Result.Ok(s) => run(c, s),
             }
         },
+    }
+}
+
+// La sesión ya abierta: un solo turno si hay petición en la línea de órdenes, si no el REPL.
+fn run(c: Config, s: agent.Session) -> int {
+    // Con una petición en la línea de órdenes el harness es de un solo turno.
+    if (c.prompt.trim() != "") {
+        match (agent.ask(s, c.prompt)) {
+            Result.Ok(u) => {
+                print(ui.usage_line(u));
+                0
+            },
+            Result.Err(e) => {
+                eprint(ui.red("✗ ") + e);
+                1
+            },
+        }
+    } else {
+        let editor = lineedit.open(lineedit.default_history_path());
+        // El modo crudo lo restaura `std/term` pase lo que pase (también al salir
+        // el proceso), así que aquí solo queda no perder el código de salida.
+        let guarded = try_call(fn() -> int {
+            repl(s, editor)
+        });
+        match (guarded) {
+            Result.Ok(code) => code,
+            Result.Err(e) => {
+                eprint(ui.red("raycode: ") + e);
+                70
+            },
+        }
     }
 }

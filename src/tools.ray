@@ -7,9 +7,12 @@ import std/process;
 import std/math;
 import std/time;
 import src/ui;
+import src/mcp;
+from src/mcp import Server;
 from std/json import Json;
 
-/// One tool as the model sees it: name, description and the JSON Schema of its arguments.
+/// One tool as the model sees it: name, description, the JSON Schema of its arguments and
+/// where it comes from (`""` for a builtin, otherwise the MCP server that declared it).
 ///
 /// It is DATA, not behaviour: la implementación se despacha por nombre en `execute`. El
 /// motivo es que la sesión entera cruza a la fibra que atiende cada paso, y un valor con
@@ -18,6 +21,7 @@ pub struct Tool {
     name: string,
     description: string,
     schema: Json,
+    source: string,
 }
 
 // Un esquema escrito como literal JSON. Es un error de programación si no parsea.
@@ -221,21 +225,24 @@ pub fn registry(allow_exec: bool) -> [Tool] {
             description: "Read a UTF-8 text file from the workspace, numbered by line. Use start_line/max_lines to page through big files.",
             schema: schema_of(
                 `{"type":"object","properties":{"path":{"type":"string","description":"Path to the file, relative to the working directory"},"start_line":{"type":"integer","description":"First line to show (1-based, default 1)"},"max_lines":{"type":"integer","description":"How many lines to show (default 400)"}},"required":["path"]}`
-            )
+            ),
+            source: ""
         },
         Tool {
             name: "write_file",
             description: "Create or overwrite a text file with the given content. The parent directory must exist.",
             schema: schema_of(
                 `{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to write"},"content":{"type":"string","description":"Full new content of the file"}},"required":["path","content"]}`
-            )
+            ),
+            source: ""
         },
         Tool {
             name: "list_dir",
             description: "List the entries of a directory; directories end with '/' and files show their size.",
             schema: schema_of(
                 `{"type":"object","properties":{"path":{"type":"string","description":"Directory to list (default '.')"}},"required":[]}`
-            )
+            ),
+            source: ""
         }
     ];
     if (allow_exec) {
@@ -245,9 +252,35 @@ pub fn registry(allow_exec: bool) -> [Tool] {
                 description: "Run a shell command in the working directory and return its merged output and exit status.",
                 schema: schema_of(
                     `{"type":"object","properties":{"command":{"type":"string","description":"The shell command line to run"},"timeout_ms":{"type":"integer","description":"Kill the command after this many milliseconds (default 30000)"}},"required":["command"]}`
-                )
+                ),
+                source: ""
             }
         );
+    }
+    tools
+}
+
+/// The catalogue entries of every enabled MCP server, discovered right now. A server that
+/// fails is marked (`enabled`, `note`) and simply contributes nothing: it never takes the
+/// session down.
+pub fn from_servers(servers: [Server]) -> [Tool] {
+    var tools: [Tool] = [];
+    for s in servers {
+        match (mcp.discover(s, mcp.DISCOVER_TIMEOUT_MS)) {
+            Result.Ok(remote) => {
+                for r in remote {
+                    tools.push(
+                        Tool {
+                            name: mcp.tool_name(s.name, r.name),
+                            description: r.description,
+                            schema: r.schema,
+                            source: s.name
+                        }
+                    );
+                }
+            },
+            Result.Err(_) => { },
+        }
     }
     tools
 }
@@ -262,10 +295,34 @@ pub fn offers(tools: [Tool], name: string) -> bool {
     false
 }
 
+// Una herramienta de un servidor MCP: el nombre expuesto se deshace en servidor y
+// herramienta remota, y la llamada viaja por `mcp.call`.
+fn dispatch_remote(servers: [Server], name: string, arguments: Json) -> Result<string, string> {
+    let (server_name, tool) = match (mcp.split_name(name)) {
+        Option.Some(pair) => pair,
+        Option.None => {
+            return Result.Err("malformed MCP tool name '${name}'");
+        },
+    };
+    let server = match (mcp.find(servers, server_name)) {
+        Option.Some(s) => s,
+        Option.None => {
+            return Result.Err("no MCP server called '${server_name}'");
+        },
+    };
+    if (!server.enabled) {
+        return Result.Err("the MCP server '${server_name}' is unavailable: ${server.note}");
+    }
+    let text = mcp.call(server, tool, arguments, mcp.CALL_TIMEOUT_MS)?;
+    Result.Ok(cap(text))
+}
+
 // El despacho por nombre. Aquí es donde el nombre que manda el modelo se convierte en
 // trabajo; `offers` decide antes si ese nombre está permitido en esta sesión.
-fn dispatch(name: string, arguments: Json) -> Result<string, string> {
-    if (name == "read_file") {
+fn dispatch(servers: [Server], name: string, arguments: Json) -> Result<string, string> {
+    if (mcp.is_remote(name)) {
+        dispatch_remote(servers, name, arguments)
+    } else if (name == "read_file") {
         tool_read_file(arguments)
     } else if (name == "write_file") {
         tool_write_file(arguments)
@@ -281,7 +338,7 @@ fn dispatch(name: string, arguments: Json) -> Result<string, string> {
 /// Runs `name` with the raw JSON `arguments` the model produced. Every failure — unknown
 /// tool, malformed arguments, tool error, panic — comes back as text for the model to
 /// read and correct, never as a crash of the session.
-pub fn execute(tools: [Tool], name: string, arguments: string) -> string {
+pub fn execute(tools: [Tool], servers: [Server], name: string, arguments: string) -> string {
     if (!offers(tools, name)) {
         return "error: unknown tool '${name}'";
     }
@@ -290,7 +347,7 @@ pub fn execute(tools: [Tool], name: string, arguments: string) -> string {
         Result.Err(e) => "error: arguments are not valid JSON (${e})",
         Result.Ok(a) => {
             let guarded = try_call(fn() -> Result<string, string> {
-                dispatch(name, a)
+                dispatch(servers, name, a)
             });
             match (guarded) {
                 Result.Err(e) => "error: tool panicked (${e})",
