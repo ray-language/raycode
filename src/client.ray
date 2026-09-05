@@ -55,6 +55,64 @@ fn parse_of(c: Config, body: string) -> Result<Reply, string> {
 /// and returns the canonical reply with the measured latency already in its usage.
 /// A non-2xx status comes back as an Err carrying the status and the body.
 pub fn send(c: Config, tools: [Tool], history: [Message]) -> Result<Reply, string> {
+    var attempt = 1;
+    while (true) {
+        let outcome = send_once(c, tools, history);
+        match (outcome) {
+            Result.Ok(_) => {
+                return outcome;
+            },
+            Result.Err(e) => {
+                if (attempt >= MAX_ATTEMPTS || !is_transient(
+                    e
+                )) {
+                    return if (attempt > 1) { Result.Err("${e} (after ${attempt} attempts)") } else { outcome };
+                }
+                back_off(c, attempt, e);
+                attempt = attempt + 1;
+            },
+        }
+    }
+    Result.Err("unreachable")
+}
+
+/// How many times a request is tried before its failure is reported.
+pub const MAX_ATTEMPTS: int = 3;
+
+/// True for the failures worth retrying: no connection, a dropped or timed-out read, a 429
+/// or a 5xx (overload, gateway). A 4xx other than 429 is the request's fault, not the
+/// network's, and comes back at once.
+pub fn is_transient(e: string) -> bool {
+    if (e.starts_with(
+        "could not connect"
+    ) || e.starts_with("error sending") || e.starts_with("error reading") || e.contains("read timeout")) {
+        return true;
+    }
+    if (e.starts_with("HTTP ")) {
+        let code = match (parse_int(e.substring(5, 8))) {
+            Option.Some(n) => n,
+            Option.None => 0,
+        };
+        return code == 429 || code == 408 || code >= 500 && code <= 599;
+    }
+    false
+}
+
+// La espera entre intentos: 1 s, 2 s, 4 s.
+fn back_off(c: Config, attempt: int, why: string) {
+    var wait = 1000;
+    var i = 1;
+    while (i < attempt) {
+        wait = wait * 2;
+        i = i + 1;
+    }
+    if (c.verbose) {
+        eprint("retrying in ${wait}ms (attempt ${attempt} failed: ${short(why)})");
+    }
+    time.sleep(wait);
+}
+
+fn send_once(c: Config, tools: [Tool], history: [Message]) -> Result<Reply, string> {
     let url = config.chat_url(c);
     let body = body_of(c, tools, history);
     if (c.verbose) {
@@ -116,6 +174,39 @@ fn stream_body_of(c: Config, tools: [Tool], history: [Message]) -> string {
 /// they land) decoded with the SSE decoder: an event can be split across chunks, even in
 /// the middle of a UTF-8 character, so the tail that does not decode yet is kept.
 pub fn send_stream(
+    c: Config,
+    tools: [Tool],
+    history: [Message],
+    paint: fn(string) -> unit
+) -> Result<Reply, string> {
+    var attempt = 1;
+    while (true) {
+        // Solo se reintenta mientras no se haya pintado nada: un fallo a mitad de respuesta
+        // dejaría al usuario viendo la misma respuesta dos veces.
+        var painted = false;
+        let outcome = send_stream_once(c, tools, history, fn(piece: string) {
+            painted = true;
+            paint(piece);
+        });
+        match (outcome) {
+            Result.Ok(_) => {
+                return outcome;
+            },
+            Result.Err(e) => {
+                if (painted || attempt >= MAX_ATTEMPTS || !is_transient(
+                    e
+                )) {
+                    return if (attempt > 1) { Result.Err("${e} (after ${attempt} attempts)") } else { outcome };
+                }
+                back_off(c, attempt, e);
+                attempt = attempt + 1;
+            },
+        }
+    }
+    Result.Err("unreachable")
+}
+
+fn send_stream_once(
     c: Config,
     tools: [Tool],
     history: [Message],

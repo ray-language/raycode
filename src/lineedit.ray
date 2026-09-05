@@ -21,6 +21,8 @@ pub struct Editor {
     tty: bool,
     history: [string],
     history_path: string,
+    // Lo tecleado mientras el modelo trabajaba: la siguiente línea empieza por aquí.
+    typeahead: bytes,
 }
 
 // El historial guardado, si lo hay. Un archivo inexistente no es un error: se empieza vacío.
@@ -70,7 +72,8 @@ pub fn open(history_path: string) -> Editor {
     Editor {
         tty: ui.interactive(),
         history: load_history(history_path),
-        history_path: history_path
+        history_path: history_path,
+        typeahead: b""
     }
 }
 
@@ -340,7 +343,10 @@ fn edit(e: Editor, prompt: string, commands: [string]) -> Option<string> {
     var stash = "";
     var width = ui.width();
     var row = redraw(prompt, line, cursor, width, 0);
-    let reader = Reader { pending: b"" };
+    // Lo que se tecleó durante el turno anterior se procesa como si llegara ahora: si
+    // acababa en Enter, la línea sale sola — un mensaje encolado.
+    let reader = Reader { pending: e.typeahead };
+    e.typeahead = b"";
     while (true) {
         let pressed = next_key(reader, IDLE_MS);
         let measured = ui.width();

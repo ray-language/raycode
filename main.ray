@@ -423,6 +423,9 @@ fn repl(s: agent.Session, editor: lineedit.Editor) -> int {
                         }
                     } else {
                         turn(s, text);
+                        // Lo tecleado durante el turno arranca la siguiente línea.
+                        editor.typeahead = s.typeahead;
+                        s.typeahead = b"";
                     }
                 }
             },

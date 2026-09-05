@@ -84,6 +84,18 @@ fn help_wins_over_a_missing_model() {
 }
 
 @test
+fn only_transient_failures_are_retried() {
+    assert(client.is_transient("could not connect: connection refused"));
+    assert(client.is_transient("error reading: read timeout"));
+    assert(client.is_transient("HTTP 429 from http://x: slow down"));
+    assert(client.is_transient("HTTP 503 from http://x: overloaded"));
+    assert(client.is_transient("HTTP 529 from http://x: overloaded"));
+    assert(!client.is_transient("HTTP 401 from http://x: bad key"));
+    assert(!client.is_transient("HTTP 400 from http://x: bad request"));
+    assert(!client.is_transient("the reply is not JSON"));
+}
+
+@test
 fn openai_bodies_carry_system_tools_and_history() {
     let c = base_config("llama");
     let body = openai.build_body(c, tools.registry(false), [message.user("hi")]);

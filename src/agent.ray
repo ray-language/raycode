@@ -47,6 +47,8 @@ pub struct Session {
     total: Usage,
     turns: int,
     steps: int,
+    /// Keys typed while the turn was running, for the line editor to pick up.
+    typeahead: bytes,
 }
 
 // Lo que sale de un paso: hay respuesta, falló, o el usuario lo paró.
@@ -69,7 +71,8 @@ pub fn open(c: Config) -> Result<Session, string> {
         history: empty,
         total: usage.zero(),
         turns: 0,
-        steps: 0
+        steps: 0,
+        typeahead: b""
     };
     reconnect(s);
     Result.Ok(s)
@@ -147,6 +150,9 @@ fn watch_keys(events: Channel<Signal>, stop: Channel<int>) {
                     if (cancels(chunk)) {
                         send(events, Signal.Cancelled);
                         watching = false;
+                    } else {
+                        // Lo que no es parar se guarda: es el principio de la siguiente línea.
+                        send(events, Signal.Typed(chunk));
                     }
                 },
                 io.ReadResult.Eof => {
@@ -158,23 +164,40 @@ fn watch_keys(events: Channel<Signal>, stop: Channel<int>) {
     }
 }
 
-// ¿Terminó el trabajo, o el usuario pulsó ESC? Devuelve true si hay que cancelar.
-fn wait_for(signals: Channel<Signal>, stop: Channel<int>) -> bool {
-    let signal = recv(signals);
+// ¿Terminó el trabajo, o el usuario pulsó ESC? Devuelve true si hay que cancelar. Lo
+// tecleado entre medias se guarda en la sesión.
+fn wait_for(s: Session, signals: Channel<Signal>, stop: Channel<int>) -> bool {
+    var cancelled = false;
+    var waiting = true;
+    while (waiting) {
+        match (recv(signals)) {
+            Option.None => {
+                waiting = false;
+            },
+            Option.Some(what) => match (what) {
+                Signal.Cancelled => {
+                    cancelled = true;
+                    waiting = false;
+                },
+                Signal.Done => {
+                    waiting = false;
+                },
+                Signal.Typed(keys) => {
+                    s.typeahead = s.typeahead + keys;
+                },
+                Signal.Text(_) => { },
+            },
+        }
+    }
     // El vigilante se retira: su fibra no debe sobrevivir al paso que vigilaba.
     send(stop, 1);
-    match (signal) {
-        Option.Some(what) => match (what) {
-            Signal.Cancelled => true,
-            _ => false,
-        },
-        Option.None => false,
-    }
+    cancelled
 }
 
 // Lo que la fibra trabajadora le cuenta al turno mientras trabaja.
 enum Signal {
     Text(string),
+    Typed(bytes),
     Done,
     Cancelled,
 }
@@ -232,6 +255,9 @@ fn call_model(s: Session, label: string, width: int, raw: bool, watch: bool) -> 
                     }
                     feed(brush, piece);
                 },
+                Signal.Typed(keys) => {
+                    s.typeahead = s.typeahead + keys;
+                },
                 Signal.Done => {
                     listening = false;
                 },
@@ -282,7 +308,7 @@ fn call_tool(s: Session, call: ToolCall, watch: bool) -> Option<string> {
         });
     }
     let running = spinner.start(hint("running ${call.name}", watch));
-    let cancelled = wait_for(signals, stop);
+    let cancelled = wait_for(s, signals, stop);
     spinner.stop_it(running);
     if (cancelled) {
         return Option.None;
@@ -406,17 +432,18 @@ fn close_pending(s: Session, calls: [ToolCall], start: int) {
 fn run_turn(s: Session, width: int, raw: bool) -> Result<Usage, string> {
     var turn = usage.zero();
     var step = 0;
-    while (step < s.config.max_steps) {
+    var limit = s.config.max_steps;
+    while (step < limit) {
         step = step + 1;
         s.steps = s.steps + 1;
         let label = if (step == 1) { "thinking" } else { "thinking · step ${step}" };
         match (call_model(
-        s,
-        hint(label, raw),
-        width,
-        raw,
-        raw
-    )) {
+            s,
+            hint(label, raw),
+            width,
+            raw,
+            raw
+        )) {
             Step.Cancelled => {
                 say(ui.yellow("■ ") + ui.dim("stopped by the user"), raw);
                 say("", raw);
@@ -470,9 +497,28 @@ fn run_turn(s: Session, width: int, raw: bool) -> Result<Usage, string> {
                 }
             },
         }
+        // El tope de pasos es un freno para un modelo que da vueltas, no un final: con un
+        // terminal delante se pregunta antes de parar.
+        if (step >= limit && raw && wants_more(limit, s.config.max_steps)) {
+            limit = limit + s.config.max_steps;
+        }
     }
-    say(ui.red("! ") + "stopped after ${s.config.max_steps} tool steps (raise --max-steps)", raw);
+    say(ui.red("! ") + "stopped after ${limit} tool steps (raise --max-steps)", raw);
     Result.Ok(turn)
+}
+
+// La pregunta al llegar al tope: una tecla, con plazo. Solo en modo crudo interactivo.
+fn wants_more(reached: int, extra: int) -> bool {
+    ui.write_inline(
+        ui.crlf(
+            ui.yellow("? ") + "${reached} tool steps so far · press c to allow ${extra} more, any other key to stop"
+        )
+    );
+    match (io.read_timeout(64, 60000)) {
+        io.ReadResult.Data(chunk) => chunk == b"c" || chunk == b"C",
+        io.ReadResult.TimedOut => false,
+        io.ReadResult.Eof => false,
+    }
 }
 
 /// Runs one user turn to completion: the model may call tools any number of times (up to

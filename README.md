@@ -219,8 +219,20 @@ medias, sus llamadas se cierran con un resultado sintético (`stopped by the use
 porque un `tool_use` sin su `tool_result` invalida el historial para el siguiente
 turno. El modelo, además, se entera de que le pararon.
 
-Mientras el turno trabaja, las teclas que se escriban se descartan: no hay
-escritura por adelantado.
+Mientras el turno trabaja se puede **escribir por adelantado**: lo tecleado se guarda y
+aparece en la siguiente línea en cuanto vuelve el prompt. Si acababa en Enter, sale
+solo: es un mensaje encolado.
+
+El turno tiene un tope de pasos de herramienta (`max_steps`, 12 por defecto, `/set
+max-steps`) que frena a un modelo que da vueltas. Al llegar, con un terminal delante,
+raycode pregunta antes de parar: `c` concede otros tantos pasos y cualquier otra tecla
+(o un minuto sin respuesta) corta el turno. Sin terminal, corta sin preguntar.
+
+Una petición que falla por la red —sin conexión, lectura cortada o vencida, `429`, `5xx`—
+se **reintenta** hasta tres veces con esperas de 1, 2 y 4 s antes de dar el error, que
+entonces dice cuántos intentos hubo; en streaming solo mientras no se haya pintado nada.
+Un `4xx` que no sea `429` es un error de la petición (clave, modelo, cuerpo) y se devuelve
+a la primera. `-v` traza cada reintento.
 
 ## Órdenes del REPL
 
