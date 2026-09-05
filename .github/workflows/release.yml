@@ -73,7 +73,9 @@ jobs:
         include:
           - { os: ubuntu-latest,    target: x86_64-unknown-linux-gnu }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
-          - { os: macos-13,         target: x86_64-apple-darwin }
+          # macos-13, the last Intel runner, is retired: the x86_64 macOS binary is
+          # cross-compiled from the arm runner (same as raylang's own release).
+          - { os: macos-14,         target: x86_64-apple-darwin }
           - { os: macos-14,         target: aarch64-apple-darwin }
     runs-on: ${{ matrix.os }}
     steps:
@@ -120,7 +122,11 @@ jobs:
           mkdir -p dist
           ray build --native main.ray -o dist/raycode --release --target ${{ matrix.target }}
           ls -la dist/raycode
-          dist/raycode --help | head -3
+          # Smoke-test only when the runner can execute the target (not cross-compiled).
+          case "${{ matrix.target }}" in
+            "$(uname -m | sed 's/^arm64$/aarch64/')"-*) dist/raycode --help | head -3 ;;
+            *) echo "cross-compiled for ${{ matrix.target }}; skipping the smoke test" ;;
+          esac
 
       - name: Package (tar.gz + sha256)
         id: package
