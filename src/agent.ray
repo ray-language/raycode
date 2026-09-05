@@ -85,6 +85,7 @@ pub fn reconnect(s: Session) {
         }
     }
     s.tools = tools.registry(s.config.allow_exec) + tools.from_servers(s.mcp);
+    s.config.mcp_instructions = mcp.instructions_of(s.mcp);
 }
 
 /// Forgets the transcript (the configuration and the accumulated usage stay).
@@ -474,8 +475,8 @@ fn run_turn(s: Session, width: int, raw: bool) -> Result<Usage, string> {
 pub fn ask(s: Session, prompt: string) -> Result<Usage, string> {
     s.history.push(message.user(prompt));
     s.turns = s.turns + 1;
-    // El ancho se mide una vez por turno, y antes de arrancar ninguna fibra: la consulta
-    // lanza un proceso y eso bloquea el planificador un instante.
+    // El ancho de referencia del turno (`term.size` es un ioctl: cada bloque lo re-mide
+    // barato, y este solo sirve de base para lo que no se pinta por bloques).
     let width = ui.width();
     // Aire entre lo que acaba de escribir el usuario y lo que va a contestar el modelo.
     print("");

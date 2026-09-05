@@ -799,6 +799,19 @@ fn mcp_remote_tools_enter_the_catalogue_and_dispatch() {
     let catalogue = tools.from_servers(servers);
     assert(servers[0].enabled);
     assert_eq(servers[0].note, "");
+    // `ray mcp` declara instrucciones en `initialize`; llegan al prompt de sistema con etiqueta.
+    assert(servers[0].instructions.contains("llms.txt"));
+    let block = mcp.instructions_of(servers);
+    assert(block.starts_with("Instructions from the MCP server 'raylang'"));
+    assert(block.contains("mcp__raylang__"));
+    var c = base_config("llama");
+    c.mcp_instructions = block;
+    assert(config.system_prompt(c).starts_with(c.system));
+    assert(config.system_prompt(c).contains("llms.txt"));
+    let body = openai.build_body(c, catalogue, [message.user("hi")]);
+    assert(body.contains("llms.txt"));
+    let anthropic_body = anthropic.build_body(base_config("anthropic"), catalogue, [message.user("hi")]);
+    assert(!anthropic_body.contains("llms.txt"));
     assert_eq(servers[0].tool_count, catalogue.len());
     assert(tools.offers(catalogue, "mcp__raylang__ray_check"));
     assert_eq(catalogue[0].source, "raylang");

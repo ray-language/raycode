@@ -171,16 +171,6 @@ fn tool_list_dir(a: Json) -> Result<string, string> {
     }
 }
 
-// El estado de salida como texto. Va aparte porque el transpilador nativo no sabe tipar
-// este `match` cuando comparte función con el `match (recv(…))` del drenado: lo deja como
-// un stub que reventaría al llamarlo.
-fn exit_label(code: process.Exit) -> string {
-    match (code) {
-        process.Exit.Code(c) => "exit ${c}",
-        process.Exit.Signal(s) => "killed by signal ${s}",
-    }
-}
-
 fn tool_run_command(a: Json) -> Result<string, string> {
     let command = need_string(a, "command")?;
     let timeout = int_or(a, "timeout_ms", 30000);
@@ -210,7 +200,10 @@ fn tool_run_command(a: Json) -> Result<string, string> {
         }
     }
     let elapsed = time.monotonic() - started;
-    let status = exit_label(p.wait());
+    let status = match (p.wait()) {
+        process.Exit.Code(c) => "exit ${c}",
+        process.Exit.Signal(sig) => "killed by signal ${sig}",
+    };
     let note = if (elapsed >= timeout) { " (timed out after ${timeout}ms)" } else { "" };
     let text = from_utf8(captured)?;
     Result.Ok(cap("[${status}${note}]\n" + text))

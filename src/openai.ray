@@ -3,6 +3,7 @@
 import std/json;
 from std/json import Json;
 from src/config import Config;
+import src/config;
 from src/message import Message, ToolCall, Reply;
 import src/message;
 from src/tools import Tool;
@@ -85,8 +86,9 @@ pub fn build_stream_body(c: Config, tools: [Tool], history: [Message]) -> string
 
 fn body_of(c: Config, tools: [Tool], history: [Message], streaming: bool) -> string {
     var messages: [Json] = [];
-    if (c.system.trim() != "") {
-        messages.push(obj(["role", "content"], [jstr("system"), jstr(c.system)]));
+    let system = config.system_prompt(c);
+    if (system.trim() != "") {
+        messages.push(obj(["role", "content"], [jstr("system"), jstr(system)]));
     }
     for m in history {
         messages.push(message_json(m));

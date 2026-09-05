@@ -5,6 +5,7 @@
 import std/json;
 from std/json import Json;
 from src/config import Config;
+import src/config;
 from src/message import Message, ToolCall, Reply;
 import src/message;
 from src/tools import Tool;
@@ -114,9 +115,10 @@ fn body_of(c: Config, tools: [Tool], history: [Message], streaming: bool) -> str
     }
     var keys = ["model", "messages", "max_tokens"];
     var values = [jstr(c.model), Json.JArray(messages), jint(c.max_tokens)];
-    if (c.system.trim() != "") {
+    let system = config.system_prompt(c);
+    if (system.trim() != "") {
         keys.push("system");
-        values.push(jstr(c.system));
+        values.push(jstr(system));
     }
     if (tools.len() > 0) {
         var decls: [Json] = [];

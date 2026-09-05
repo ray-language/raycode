@@ -27,6 +27,7 @@ pub struct Config {
     mcp_enabled: bool,
     mcp_config: string,
     help: bool,
+    mcp_instructions: string,
 }
 
 /// The protocol name, for the banner.
@@ -83,7 +84,8 @@ fn preset(profile: string) -> Result<Config, string> {
         prompt: "",
         mcp_enabled: env_or("RAYCODE_MCP", "on") != "off",
         mcp_config: env_or("RAYCODE_MCP_CONFIG", ""),
-        help: false
+        help: false,
+        mcp_instructions: ""
     };
     if (profile == "llama" || profile == "local") {
         base.api = Api.OpenAI;
@@ -198,6 +200,19 @@ pub fn load(argv: [string]) -> Result<Config, string> {
         return Result.Err("no model: pass --model or set RAYCODE_MODEL");
     }
     Result.Ok(cfg)
+}
+
+/// The system prompt as sent to the model: the user's, followed by whatever the MCP
+/// servers asked for in their `initialize` reply. `/system` shows and edits only the first
+/// part; the second follows the servers.
+pub fn system_prompt(c: Config) -> string {
+    if (c.mcp_instructions.trim() == "") {
+        c.system
+    } else if (c.system.trim() == "") {
+        c.mcp_instructions
+    } else {
+        c.system + "\n\n" + c.mcp_instructions
+    }
 }
 
 /// The endpoint URL for a chat completion, derived from the base URL and the protocol.

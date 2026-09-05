@@ -17,7 +17,8 @@ import src/ui;
 from std/json import Json;
 
 /// One MCP server as configured, plus what discovery learned about it. `note` keeps
-/// the last error (empty when healthy) and `tool_count` what the catalogue holds.
+/// the last error (empty when healthy), `tool_count` what the catalogue holds and
+/// `instructions` the system-prompt text the server declared in `initialize`.
 pub struct Server {
     name: string,
     command: string,
@@ -27,6 +28,7 @@ pub struct Server {
     enabled: bool,
     note: string,
     tool_count: int,
+    instructions: string,
 }
 
 /// A tool as the server declares it: raw name, description and its JSON Schema. It is
@@ -56,6 +58,8 @@ const MAX_STDERR: int = 2048;
 
 // La `id` de la petición útil del lote: `initialize` lleva la 1.
 const REQUEST_ID: int = 2;
+
+const HELLO_ID: int = 1;
 
 const NAME_PREFIX: string = "mcp__";
 
@@ -202,7 +206,7 @@ fn parse_server(name: string, spec: Json) -> Result<Server, string> {
         Option.None => false,
     };
     Result.Ok(
-        Server { name: name, command: command, args: arguments, dir: dir, env: environment, enabled: !disabled, note: if (disabled) { "disabled in the configuration" } else { "" }, tool_count: 0 }
+        Server { name: name, command: command, args: arguments, dir: dir, env: environment, enabled: !disabled, note: if (disabled) { "disabled in the configuration" } else { "" }, tool_count: 0, instructions: "" }
     )
 }
 
@@ -263,7 +267,7 @@ fn request(id: int, method: string, params: Json) -> string {
 /// the request itself (id 2), one JSON line each.
 pub fn batch(method: string, params: Json) -> string {
     let hello = request(
-        1,
+        HELLO_ID,
         "initialize",
         obj(
             ["protocolVersion", "capabilities", "clientInfo"],
@@ -428,15 +432,6 @@ pub fn check_size(text: string, arguments: Json) -> Result<int, string> {
 
 // ---------------------------------------------------------------- transporte
 
-// El estado de salida como texto. Función aparte por lo mismo que en `tools`: el
-// transpilador nativo no tipa este `match` junto al del drenado.
-fn exit_label(code: process.Exit) -> string {
-    match (code) {
-        process.Exit.Code(c) => "exit ${c}",
-        process.Exit.Signal(s) => "signal ${s}",
-    }
-}
-
 // Lo que un canal de salida produjo, entero (acotado en `MAX_STDERR` para stderr).
 fn drain(channel: Channel<bytes>, cap: int) -> bytes {
     var captured = b"";
@@ -460,7 +455,9 @@ fn drain(channel: Channel<bytes>, cap: int) -> bytes {
 // devuelve la respuesta con la `id` pedida. Se lanza en STREAMING —como `run_command`—
 // porque drenar el canal aparca la fibra y deja vivo el indicador, mientras que `run()`
 // congelaría el planificador. El plazo se compone a mano: fibra guardiana + `kill`.
-fn exchange(s: Server, method: string, params: Json, timeout_ms: int) -> Result<Json, string> {
+// Devuelve el `result` de la petición y el del `initialize` (vacío si no llegó): ahí viajan
+// las `instructions` del servidor, que solo interesan al descubrir.
+fn exchange(s: Server, method: string, params: Json, timeout_ms: int) -> Result<(Json, Json), string> {
     let text = batch(method, params);
     check_size(text, params)?;
     var command = process.cmd(s.command, s.args).stdin(text.to_bytes());
@@ -492,7 +489,10 @@ fn exchange(s: Server, method: string, params: Json, timeout_ms: int) -> Result<
     });
     let out = drain(p.out, 0);
     let elapsed = time.monotonic() - started;
-    let status = exit_label(p.wait());
+    let status = match (p.wait()) {
+        process.Exit.Code(c) => "exit ${c}",
+        process.Exit.Signal(sig) => "signal ${sig}",
+    };
     let stderr = match (recv(errors)) {
         Option.Some(b) => match (from_utf8(b)) {
             Result.Ok(t) => t.trim(),
@@ -506,8 +506,18 @@ fn exchange(s: Server, method: string, params: Json, timeout_ms: int) -> Result<
             return Result.Err("the server wrote non-UTF-8 output");
         },
     };
+    let hello = match (pick(output, HELLO_ID)) {
+        Option.Some(reply) => match (result_of(reply)) {
+            Result.Ok(r) => r,
+            Result.Err(_) => empty_object(),
+        },
+        Option.None => empty_object(),
+    };
     match (pick(output, REQUEST_ID)) {
-        Option.Some(reply) => result_of(reply),
+        Option.Some(reply) => match (result_of(reply)) {
+            Result.Ok(r) => Result.Ok((r, hello)),
+            Result.Err(e) => Result.Err(e),
+        },
         Option.None => {
             let why = if (elapsed >= timeout_ms) {
                 "timed out after ${timeout_ms}ms"
@@ -526,24 +536,33 @@ pub fn discover(s: Server, timeout_ms: int) -> Result<[RemoteTool], string> {
     if (!s.enabled) {
         return Result.Ok([]);
     }
+    var hello = empty_object();
     let outcome: Result<[RemoteTool], string> = match (exchange(
         s,
         "tools/list",
         empty_object(),
         timeout_ms
     )) {
-        Result.Ok(result) => parse_tools(result),
+        Result.Ok(pair) => {
+            hello = pair.1;
+            parse_tools(pair.0)
+        },
         Result.Err(e) => Result.Err(e),
     };
     match (outcome) {
         Result.Ok(tools) => {
             s.note = "";
             s.tool_count = tools.len();
+            s.instructions = match (json.get_string(hello, "instructions")) {
+                Option.Some(text) => text.trim(),
+                Option.None => "",
+            };
         },
         Result.Err(e) => {
             s.enabled = false;
             s.note = e;
             s.tool_count = 0;
+            s.instructions = "";
         },
     }
     outcome
@@ -552,8 +571,20 @@ pub fn discover(s: Server, timeout_ms: int) -> Result<[RemoteTool], string> {
 /// `tools/call` of `tool` (the raw server-side name) with the parsed `arguments`.
 pub fn call(s: Server, tool: string, arguments: Json, timeout_ms: int) -> Result<string, string> {
     let params = obj(["name", "arguments"], [jstr(tool), arguments]);
-    let result = exchange(s, "tools/call", params, timeout_ms)?;
-    flatten(result)
+    let pair = exchange(s, "tools/call", params, timeout_ms)?;
+    flatten(pair.0)
+}
+
+/// What every enabled server asked to put in the system prompt, one labelled block per
+/// server; empty when none declared instructions.
+pub fn instructions_of(servers: [Server]) -> string {
+    var blocks: [string] = [];
+    for s in servers {
+        if (s.enabled && s.instructions != "") {
+            blocks.push("Instructions from the MCP server '${s.name}' (its tools are prefixed mcp__${s.name}__):\n${s.instructions}");
+        }
+    }
+    blocks.join("\n\n")
 }
 
 /// One line describing how the server is launched, for the banner and `/mcp`.

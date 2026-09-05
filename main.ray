@@ -93,6 +93,9 @@ fn show_mcp(s: agent.Session) {
     }
     for server in s.mcp {
         print("  " + mcp_summary(server));
+        if (server.instructions != "") {
+            print(ui.dim(ui.indent("instructions: " + ui.clip(server.instructions, 400), "    ")));
+        }
         for t in s.tools {
             if (t.source == server.name) {
                 print("    " + t.name);
@@ -300,6 +303,9 @@ fn command(s: agent.Session, line: string) -> bool {
     } else if (name == "/system") {
         if (rest == "") {
             print(ui.dim(s.config.system));
+            if (s.config.mcp_instructions != "") {
+                print(ui.dim("+ the MCP servers' instructions (see /mcp)"));
+            }
         } else {
             s.config.system = rest;
             agent.reset(s);
