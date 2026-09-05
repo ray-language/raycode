@@ -97,6 +97,7 @@ ray run main.ray -p openai -m gpt-4o-mini          # API de OpenAI
 ray run main.ray --allow-exec "resume este repo"   # una sola petición, con shell
 ray test                                           # las pruebas del harness
 raycode --help                                     # banderas, entorno y ejemplos
+raycode --version
 ```
 
 Un turno del usuario dispara un bucle de herramientas hasta que el modelo responde;
@@ -334,7 +335,8 @@ entorno: `RAYCODE_MCP_CONFIG` y `RAYCODE_MCP=off`.
 Banderas: `-p/--provider`, `-u/--base-url`, `-m/--model`, `-k/--api-key`,
 `-s/--system`, `--max-tokens`, `-t/--temperature`, `--timeout-ms`, `--max-steps`,
 `--no-stream`, `--allow-exec`, `--mcp-config`, `--no-mcp`, `-v/--verbose`,
-`-h/--help`. Lo que sobre en la línea de órdenes es la petición de un solo turno.
+`-h/--help`, `-V/--version`. Lo que sobre en la línea de órdenes es la petición de un
+solo turno.
 
 Entorno: `RAYCODE_PROFILE`, `RAYCODE_BASE_URL`, `RAYCODE_MODEL`, `RAYCODE_API_KEY`,
 `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `RAYCODE_SYSTEM`, `RAYCODE_MAX_TOKENS`,
@@ -377,7 +379,8 @@ tamaño de la ventana, `std/io` la lectura con plazo, y `std/json`, `std/process
 `.github/workflows/release.yml` se dispara al empujar un tag `vX.Y.Z`:
 
 ```sh
-# ray.toml y el tag tienen que decir lo mismo — el workflow lo comprueba y falla si no
+# ray.toml, VERSION en src/config.ray y el tag tienen que decir lo mismo — el workflow
+# lo comprueba y falla si no
 git tag -a v0.1.0 -m "raycode 0.1.0"
 git push origin v0.1.0
 ```

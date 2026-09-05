@@ -20,6 +20,7 @@ import std/process;
 import std/time;
 import std/fs;
 import src/ui;
+import src/config;
 import net/http;
 import net/sse;
 from std/json import Json;
@@ -321,7 +322,7 @@ pub fn handshake() -> string {
             [
                 jstr(PROTOCOL_VERSION),
                 empty_object(),
-                obj(["name", "version"], [jstr("raycode"), jstr("0.1.0")])
+                obj(["name", "version"], [jstr("raycode"), jstr(config.VERSION)])
             ]
         )
     );

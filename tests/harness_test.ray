@@ -65,9 +65,22 @@ fn help_wins_over_a_missing_model() {
         Result.Err(e) => panic(e),
     }
     match (config.load(["-m", "m"])) {
-        Result.Ok(c) => assert(!c.help),
+        Result.Ok(c) => {
+            assert(!c.help);
+            assert(!c.version);
+        },
         Result.Err(e) => panic(e),
     }
+    match (config.load(["--version"])) {
+        Result.Ok(c) => assert(c.version),
+        Result.Err(e) => panic(e),
+    }
+    // La versión del código y la del manifiesto no pueden divergir sin que se note.
+    let manifest = match (fs.read_file("ray.toml")) {
+        Result.Ok(t) => t,
+        Result.Err(e) => panic(e),
+    };
+    assert(manifest.contains("version = \"${config.VERSION}\""));
 }
 
 @test

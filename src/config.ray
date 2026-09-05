@@ -2,6 +2,10 @@
 // credenciales y parámetros de muestreo. Todo se puede fijar por entorno y sobreescribir
 // por bandera de línea de órdenes.
 
+/// The version raycode reports (`--version`, the MCP `clientInfo`). Must match `ray.toml`:
+/// the release workflow refuses a tag where the two disagree.
+pub const VERSION: string = "0.1.0";
+
 /// The wire protocol spoken to the endpoint.
 pub enum Api {
     Anthropic,
@@ -27,6 +31,7 @@ pub struct Config {
     mcp_enabled: bool,
     mcp_config: string,
     help: bool,
+    version: bool,
     mcp_instructions: string,
 }
 
@@ -85,6 +90,7 @@ fn preset(profile: string) -> Result<Config, string> {
         mcp_enabled: env_or("RAYCODE_MCP", "on") != "off",
         mcp_config: env_or("RAYCODE_MCP_CONFIG", ""),
         help: false,
+        version: false,
         mcp_instructions: ""
     };
     if (profile == "llama" || profile == "local") {
@@ -186,6 +192,9 @@ pub fn load(argv: [string]) -> Result<Config, string> {
         } else if (a == "--help" || a == "-h") {
             // Pedir ayuda no es arrancar: se sale antes de exigir modelo ni nada más.
             cfg.help = true;
+            return Result.Ok(cfg);
+        } else if (a == "--version" || a == "-V") {
+            cfg.version = true;
             return Result.Ok(cfg);
         } else if (a.starts_with("-")) {
             return Result.Err("unknown flag '${a}'");

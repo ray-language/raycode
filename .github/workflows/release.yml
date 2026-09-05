@@ -49,6 +49,11 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME does not match ray.toml version $manifest"
             exit 1
           fi
+          code="$(sed -n 's/^pub const VERSION: string = "\(.*\)";/\1/p' src/config.ray | head -1)"
+          if [ "$code" != "$tag" ]; then
+            echo "::error::src/config.ray VERSION is $code, tag is $GITHUB_REF_NAME"
+            exit 1
+          fi
           echo "version $manifest"
       - name: Create the Release (idempotent)
         env:

@@ -436,7 +436,7 @@ const USAGE_LINE: string = "usage: raycode [-p llama|openai|anthropic] [-m model
 // La ayuda de línea de órdenes (`--help`): banderas, entorno y órdenes del REPL.
 fn usage() {
     print(
-        ui.bold(ui.magenta("raycode")) + ui.dim(" · a raylang harness for local and remote models")
+        ui.bold(ui.magenta("raycode")) + ui.dim(" ${config.VERSION} · a raylang harness for local and remote models")
     );
     print("");
     print(USAGE_LINE);
@@ -464,6 +464,7 @@ fn usage() {
     print("      --no-mcp             do not start any MCP server");
     print("  -v, --verbose            trace requests and responses on stderr");
     print("  -h, --help               this help");
+    print("  -V, --version            print the version and exit");
     print("");
     print(ui.bold("environment"));
     print("  RAYCODE_PROFILE, RAYCODE_BASE_URL, RAYCODE_MODEL, RAYCODE_API_KEY, RAYCODE_SYSTEM,");
@@ -489,6 +490,9 @@ fn main() -> int {
         },
         Result.Ok(c) => if (c.help) {
             usage();
+            0
+        } else if (c.version) {
+            print("raycode ${config.VERSION}");
             0
         } else {
             match (agent.open(c)) {
