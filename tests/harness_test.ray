@@ -15,6 +15,7 @@ import src/render;
 import src/mcp;
 import std/json;
 import std/process;
+import net/webserver;
 from src/config import Api;
 
 fn no_servers() -> [mcp.Server] {
@@ -920,4 +921,115 @@ fn mcp_a_server_that_dies_mid_session_is_reported_and_relaunched() {
         Result.Err(e) => panic(e),
     }
     mcp.shutdown(servers);
+}
+
+// Un servidor MCP por HTTP de mentira, en proceso: sesión por cabecera, `initialize` en
+// JSON, `tools/list` como flujo SSE y `tools/call` en JSON, 404 sin la sesión.
+fn fake_http_mcp(req: webserver.Request) -> webserver.Response {
+    let body = match (from_utf8(req.body)) {
+        Result.Ok(t) => t,
+        Result.Err(_) => "",
+    };
+    let id = match (json.parse(body)) {
+        Result.Ok(j) => match (json.get_int(j, "id")) {
+            Option.Some(n) => n,
+            Option.None => 0 - 1,
+        },
+        Result.Err(_) => 0 - 1,
+    };
+    if (req.method == "DELETE") {
+        return webserver.text(200, "");
+    }
+    if (body.contains(
+        "\"initialize\""
+    )) {
+        var r = webserver.json_response(
+            `{"jsonrpc":"2.0","id":${id},"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"fake"},"instructions":"over http"}}`
+        );
+        r.headers.insert("Mcp-Session-Id", "s1");
+        return r;
+    }
+    let session = match (get(req.headers, "mcp-session-id")) {
+        Option.Some(v) => v,
+        Option.None => "",
+    };
+    if (session != "s1") {
+        return webserver.text(404, "no such session");
+    }
+    if (body.contains("notifications/initialized")) {
+        return webserver.text(202, "");
+    }
+    if (body.contains(
+        "tools/list"
+    )) {
+        var r = webserver.text(
+            200,
+            ": keep-alive\n\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":${id},\"result\":{\"tools\":[{\"name\":\"echo\",\"inputSchema\":{\"type\":\"object\"}}]}}\n\n"
+        );
+        r.headers.insert("Content-Type", "text/event-stream");
+        return r;
+    }
+    if (body.contains(
+        "tools/call"
+    )) {
+        return webserver.json_response(
+            `{"jsonrpc":"2.0","id":${id},"result":{"content":[{"type":"text","text":"echo: ${body.len()} bytes, session ${session}"}]}}`
+        );
+    }
+    webserver.json_response(
+        `{"jsonrpc":"2.0","id":${id},"error":{"code":-32601,"message":"method not found"}}`
+    )
+}
+
+@test
+fn mcp_speaks_streamable_http() {
+    let port = 18731;
+    spawn(fn() {
+        match (webserver.serve("127.0.0.1", port, fake_http_mcp)) {
+            Result.Ok(_) => { },
+            Result.Err(e) => print("fake http mcp: ${e}"),
+        }
+    });
+    time.sleep(100);
+    let servers = match (mcp.parse_config(
+        `{"mcpServers":{"web":{"type":"http","url":"http://127.0.0.1:${port}/mcp","headers":{"Authorization":"Bearer x"}}}}`
+    )) {
+        Result.Ok(s) => s,
+        Result.Err(e) => panic(e),
+    };
+    assert(mcp.is_http(servers[0]));
+    assert_eq(mcp.command_line(servers[0]), "http://127.0.0.1:${port}/mcp");
+    let catalogue = tools.from_servers(servers);
+    assert_eq(servers[0].note, "");
+    assert(servers[0].enabled);
+    assert_eq(servers[0].instructions, "over http");
+    assert(tools.offers(catalogue, "mcp__web__echo"));
+    // La llamada viaja con la sesión que dio el initialize (sin ella el servidor da 404).
+    let out = tools.execute(catalogue, servers, "mcp__web__echo", `{"x":1}`);
+    assert(out.starts_with("echo:"));
+    assert(out.contains("session s1"));
+    mcp.shutdown(servers);
+    assert(!servers[0].running);
+}
+
+@test
+fn mcp_http_config_is_validated() {
+    match (mcp.parse_config(`{"mcpServers":{"x":{"url":"ftp://nope"}}}`)) {
+        Result.Ok(_) => panic("expected an error"),
+        Result.Err(e) => assert(e.contains("http://")),
+    }
+    match (mcp.parse_config(`{"mcpServers":{"x":{"headers":{}}}}`)) {
+        Result.Ok(_) => panic("expected an error"),
+        Result.Err(e) => assert(e.contains("url")),
+    }
+    // Un servidor HTTP que no existe se marca y no aporta nada, como uno stdio que no arranca.
+    let servers = match (mcp.parse_config(
+        `{"mcpServers":{"down":{"url":"http://127.0.0.1:9/mcp"}}}`
+    )) {
+        Result.Ok(s) => s,
+        Result.Err(e) => panic(e),
+    };
+    assert_eq(tools.from_servers(servers).len(), 0);
+    assert(!servers[0].enabled);
+    assert(servers[0].note.contains("cannot reach"));
 }

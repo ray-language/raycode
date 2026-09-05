@@ -125,7 +125,9 @@ vencido y cierre ordenado al salir. El tope de 60 KiB desapareció con él: `Pro
 aparca la fibra con contrapresión en vez de clavar la VM. Las `instructions` del
 `initialize` van al prompt de sistema. Fase 3 hecha: `resources/list` en el descubrimiento,
 `read_resource` como herramienta única con el catálogo en su descripción, y `/resource
-<uri>` para inyectar uno a mano. Queda la 4b (HTTP/SSE).
+<uri>` para inyectar uno a mano. Fase 4b hecha: transporte *Streamable HTTP* (`url` +
+`headers` en la configuración, sesión por `Mcp-Session-Id`, respuesta JSON o SSE, reintento
+tras 404) sobre `net/http` y `net/sse`. El plan está completo.
 
 ## Fases
 

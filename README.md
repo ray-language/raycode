@@ -256,7 +256,18 @@ bloque se puede copiar tal cual:
 ```
 
 Campos por servidor: `command`, `args`, `env`, `dir` (relativo al espacio de trabajo)
-y `disabled`. Cada herramienta se expone al modelo como `mcp__<servidor>__<tool>`
+y `disabled` para un servidor por stdio; `url` y `headers` (un `Authorization`, por
+ejemplo) para uno remoto por HTTP:
+
+```json
+{
+  "mcpServers": {
+    "raylang": { "command": "ray", "args": ["mcp"] },
+    "docs":    { "type": "http", "url": "https://mcp.example.com/mcp",
+                 "headers": { "Authorization": "Bearer …" } }
+  }
+}
+``` Cada herramienta se expone al modelo como `mcp__<servidor>__<tool>`
 —`mcp__raylang__ray_check`—, así que no hay colisiones y el origen se lee en la traza.
 
 ```
@@ -283,6 +294,14 @@ petición lo relanza —lo mismo si muere por su cuenta. Al salir, raycode cierr
 de cada servidor y espera a que termine (a la fuerza tras 2 s). Las `instructions` que
 un servidor declara en `initialize` se añaden al prompt de sistema, etiquetadas con su
 nombre (`/system` muestra solo la parte del usuario; `/mcp` enseña las del servidor).
+
+Por **HTTP** el cliente habla el *Streamable HTTP* del protocolo: cada petición es un
+`POST` con la línea JSON-RPC, y la respuesta llega como JSON o como flujo SSE del que se
+toma el evento con la misma `id`. La sesión la identifica la cabecera `Mcp-Session-Id`
+que devuelve el `initialize`; un 404 con ella se entiende como sesión caducada, se vuelve
+a inicializar y se reintenta una vez. Al salir se manda el `DELETE` de cierre. Mismo actor
+y mismo canal que por stdio: el resto del harness no distingue un transporte del otro. El
+transporte antiguo "HTTP+SSE" (un `GET /sse` con evento `endpoint`) no está soportado.
 Los resultados llegan al modelo como texto: los bloques `text` tal cual, los demás
 resumidos (`[image 12 KiB]`), e `isError` por el mismo camino que cualquier fallo de
 herramienta —error legible, nunca un panic.
