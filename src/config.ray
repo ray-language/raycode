@@ -4,7 +4,7 @@
 
 /// The version raycode reports (`--version`, the MCP `clientInfo`). Must match `ray.toml`:
 /// the release workflow refuses a tag where the two disagree.
-pub const VERSION: string = "0.1.0";
+pub const VERSION: string = "0.2.0";
 
 /// The wire protocol spoken to the endpoint.
 pub enum Api {
