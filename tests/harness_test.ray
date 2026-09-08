@@ -17,6 +17,7 @@ import std/json;
 import std/process;
 import net/webserver;
 import src/picker;
+import src/agent;
 from src/config import Api;
 
 fn no_servers() -> [mcp.Server] {
@@ -1097,4 +1098,22 @@ fn mcp_http_config_is_validated() {
     assert_eq(tools.from_servers(servers).len(), 0);
     assert(!servers[0].enabled);
     assert(servers[0].note.contains("cannot reach"));
+}
+
+@test
+fn a_tool_call_reads_as_code_not_as_json() {
+    let lines = agent.call_summary(
+        "write_file",
+        "{\"path\":\"src/theme.ray\",\"content\":\"pub fn css() -> string {\\n    `:root { --bg: 0 0% 100%; }`\\n}\\n\"}"
+    );
+    assert(lines[0].contains("path: src/theme.ray"));
+    // El contenido largo no viaja en la cabecera: baja abajo, ya sin escapar.
+    assert(!lines[0].contains("--bg"));
+    assert_eq(lines[1], "  content · 3 lines");
+    assert(lines[2].ends_with("pub fn css() -> string {"));
+    assert(!lines[2].contains("\\n"));
+    // Lo que no es un objeto JSON se enseña tal cual.
+    let odd = agent.call_summary("weird", "not json");
+    assert_eq(odd.len(), 1);
+    assert(odd[0].contains("not json"));
 }

@@ -25,6 +25,8 @@ import std/io;
 from std/term import Key;
 import src/ui;
 import std/time;
+import std/json;
+from std/json import Json;
 
 // Cada cuánto se mira el teclado mientras se espera.
 const POLL_MS: int = 60;
@@ -394,9 +396,113 @@ fn paint(p: Painter, text: string) {
     say("", p.raw);
 }
 
-// Una línea por llamada a herramienta, con los argumentos recortados.
+// Cuántas líneas de un argumento largo se enseñan antes de resumir el resto.
+const PREVIEW_LINES: int = 8;
+
+// A partir de cuántos caracteres un argumento deja de caber en la cabecera.
+const INLINE_MAX: int = 72;
+
+// El valor tal como cabe en la cabecera, o `None` si es largo o tiene saltos: eso baja
+// abajo como código.
+fn inline_value(v: Json) -> Option<string> {
+    let text = match (v) {
+        Json.JStr(s) => s,
+        Json.JNull => "null",
+        Json.JBool(b) => if (b) { "true" } else { "false" },
+        _ => json.stringify(v),
+    };
+    if (text.contains("\n") || text.len() > INLINE_MAX) {
+        Option.None
+    } else {
+        Option.Some(text)
+    }
+}
+
+// Un argumento largo, convertido en las líneas del código que es (nunca en el JSON
+// escapado que viajó por el cable): unas cuantas y cuántas quedan.
+fn block_lines(key: string, value: string) -> [string] {
+    var body = value;
+    while (body.ends_with("\n")) {
+        body = body.substring(0, body.len() - 1);
+    }
+    let lines = body.split("\n");
+    let width = ui.width() - 6;
+    var out: [string] = ["  " + key + " · " + plural(lines.len(), "line")];
+    var i = 0;
+    while (i < lines.len() && i < PREVIEW_LINES) {
+        out.push("  │ " + ui.clip(lines[i], width));
+        i = i + 1;
+    }
+    if (lines.len() > PREVIEW_LINES) {
+        out.push("  │ … " + plural(lines.len() - PREVIEW_LINES, "more line"));
+    }
+    out
+}
+
+// "1 line" / "3 lines": el resumen se lee mejor sin el "(s)".
+fn plural(n: int, noun: string) -> string {
+    if (n == 1) { "${n} ${noun}" } else { "${n} ${noun}s" }
+}
+
+/// How a tool call reads on screen, without any colour: the first line is the tool and its
+/// short arguments, and every long one — the contents of a file, a patch — follows as the
+/// code it is. Arguments that are not a JSON object (a model may send anything) stay as
+/// they came, clipped.
+pub fn call_summary(name: string, arguments: string) -> [string] {
+    let fields = match (json.parse(arguments.trim())) {
+        Result.Ok(j) => json.as_object(j),
+        Result.Err(_) => Option.None,
+    };
+    match (fields) {
+        Option.None => [name + " " + ui.clip(arguments.trim(), 160)],
+        Option.Some(table) => {
+            var inline: [string] = [];
+            var blocks: [string] = [];
+            for key in table.keys().sort() {
+                match (table.get(key)) {
+                    Option.Some(v) => match (inline_value(v)) {
+                        Option.Some(text) => {
+                            inline.push(key + ": " + text);
+                        },
+                        Option.None => {
+                            blocks.push(key);
+                        },
+                    },
+                    Option.None => { },
+                }
+            }
+            let summary = if (inline.len() == 0) { "" } else { " " + inline.join("  ") };
+            var out: [string] = [name + ui.clip(summary, ui.width() - name.len() - 4)];
+            for key in blocks {
+                match (table.get(key)) {
+                    Option.Some(v) => {
+                        let text = match (json.as_string(v)) {
+                            Option.Some(str) => str,
+                            Option.None => json.stringify_pretty(v, 2),
+                        };
+                        for line in block_lines(key, text) {
+                            out.push(line);
+                        }
+                    },
+                    Option.None => { },
+                }
+            }
+            out
+        },
+    }
+}
+
+// La llamada en pantalla: la cabecera con su viñeta y el resto en gris, como el resultado.
 fn show_call(name: string, arguments: string, raw: bool) {
-    say(ui.yellow("⚙ ") + ui.bold(name) + ui.dim(" " + ui.clip(arguments.trim(), 160)), raw);
+    let lines = call_summary(name, arguments);
+    let head = lines[0];
+    let cut = name.len();
+    say(ui.yellow("⚙ ") + ui.bold(name) + ui.dim(head.substring(cut, head.len())), raw);
+    var i = 1;
+    while (i < lines.len()) {
+        say(ui.dim(lines[i]), raw);
+        i = i + 1;
+    }
 }
 
 // El resultado, sangrado y recortado: el modelo lo ve entero, el usuario un resumen.

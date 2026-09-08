@@ -136,6 +136,11 @@ se suman las herramientas de cualquier [servidor MCP](#servidores-mcp).
   una fibra guardiana mata el grupo de proceso al vencer `timeout_ms`). Cada fallo — herramienta desconocida, argumentos rotos,
   error de E/S, `panic` — vuelve al modelo como texto para que se corrija, nunca
   tumba la sesión.
+- **La traza, legible.** Una llamada a herramienta no se enseña como el JSON que
+  viajó por el cable: los argumentos cortos van en la cabecera (`⚙ write_file path:
+  fib.ray`) y los largos —el contenido de un fichero, un parche— bajan debajo como
+  el código que son, sin escapar, con las primeras ocho líneas y cuántas quedan. Si
+  los argumentos no son un objeto JSON se enseñan tal cual, recortados.
 - **Respuestas cortadas, dichas.** Si el proveedor corta la respuesta por el tope de
   tokens (`length` en OpenAI, `max_tokens` en Anthropic) el harness lo avisa en vez de
   dejar una frase a medias que parece completa. El tope por defecto es 4096 y se sube
@@ -333,9 +338,13 @@ Con `ray mcp` el bucle es el de escribir raylang y verificarlo en el mismo turno
 
 ```
 › escribe en fib.ray una función fib(n) y comprueba que compila
-⚙ write_file {"path":"fib.ray","content":"fn fib(n: int) -> int { ..."}
+⚙ write_file path: fib.ray
+  content · 3 lines
+  │ fn fib(n: int) -> int {
+  │     if (n < 2) { n } else { fib(n - 1) + fib(n - 2) }
+  │ }
   │ wrote 118 bytes to fib.ray
-⚙ mcp__raylang__ray_check {"path":"fib.ray"}
+⚙ mcp__raylang__ray_check path: fib.ray
   │ exit: 0
   │ ok: 'fib.ray' compiles
 ```
