@@ -8,6 +8,7 @@
 // es la conversación: las llamadas sin responder se cierran con un resultado sintético
 // para que el historial siga siendo válido en el siguiente turno.
 from src/config import Config;
+import src/config;
 from src/message import Message, ToolCall, Reply;
 import src/message;
 from src/tools import Tool;
@@ -102,6 +103,8 @@ pub fn reconnect(s: Session) {
 pub fn reset(s: Session) {
     let empty: [Message] = [];
     s.history = empty;
+    // Conversación nueva, id nuevo: el proxy no debe enlazarla con la anterior.
+    config.new_session(s.config);
 }
 
 // En modo crudo el terminal no traduce NINGÚN salto de línea: hay que devolver el carro a
@@ -437,13 +440,7 @@ fn run_turn(s: Session, width: int, raw: bool) -> Result<Usage, string> {
         step = step + 1;
         s.steps = s.steps + 1;
         let label = if (step == 1) { "thinking" } else { "thinking · step ${step}" };
-        match (call_model(
-            s,
-            hint(label, raw),
-            width,
-            raw,
-            raw
-        )) {
+        match (call_model(s, hint(label, raw), width, raw, raw)) {
             Step.Cancelled => {
                 say(ui.yellow("■ ") + ui.dim("stopped by the user"), raw);
                 say("", raw);
@@ -462,9 +459,7 @@ fn run_turn(s: Session, width: int, raw: bool) -> Result<Usage, string> {
                     show_answer(reply.message.text.trim(), width, raw);
                     say("", raw);
                 }
-                if (message.was_truncated(
-                    reply.stop_reason
-                )) {
+                if (message.was_truncated(reply.stop_reason)) {
                     // El modelo no terminó: se quedó sin cupo. Decirlo importa, porque la
                     // respuesta parece completa hasta que se lee el final.
                     say(
@@ -540,8 +535,8 @@ pub fn ask(s: Session, prompt: string) -> Result<Usage, string> {
     // vez de quedarse en el búfer de línea hasta el siguiente Enter. `term.raw` lo restaura
     // pase lo que pase dentro —incluido un panic— y también al salir el proceso.
     match (term.raw(fn() -> Result<Usage, string> {
-    run_turn(s, width, true)
-})) {
+        run_turn(s, width, true)
+    })) {
         Result.Ok(outcome) => outcome,
         Result.Err(e) => Result.Err("the turn failed: ${e}"),
     }

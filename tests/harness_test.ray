@@ -98,6 +98,46 @@ fn the_picker_filters_case_insensitively_and_keeps_order() {
 }
 
 @test
+fn every_request_identifies_the_client_and_the_conversation() {
+    let c = base_config("llama");
+    let h = openai.headers(c);
+    match (get(h, "User-Agent")) {
+        Option.Some(ua) => assert_eq(ua, "raycode/${config.VERSION}"),
+        Option.None => panic("no User-Agent"),
+    }
+    match (get(h, "x-opencode-session")) {
+        Option.Some(id) => {
+            assert_eq(id, c.session_id);
+            assert_eq(id.len(), 36);
+        },
+        Option.None => panic("no x-opencode-session"),
+    }
+    // El id es estable dentro de la conversación y cambia al empezar otra.
+    let before = c.session_id;
+    config.new_session(c);
+    assert(c.session_id != before);
+    // `-H` añade cabeceras y manda sobre las del adaptador; se valida el formato.
+    match (config.load(["-m", "m", "-H", "X-Team: blue", "-H", "Accept: text/plain"])) {
+        Result.Ok(with) => {
+            let a = anthropic.headers(with);
+            match (get(a, "X-Team")) {
+                Option.Some(v) => assert_eq(v, "blue"),
+                Option.None => panic("no X-Team"),
+            }
+            match (get(a, "Accept")) {
+                Option.Some(v) => assert_eq(v, "text/plain"),
+                Option.None => panic("no Accept"),
+            }
+        },
+        Result.Err(e) => panic(e),
+    }
+    match (config.load(["-m", "m", "-H", "nocolon"])) {
+        Result.Ok(_) => panic("expected an error"),
+        Result.Err(e) => assert(e.contains("Name: value")),
+    }
+}
+
+@test
 fn only_transient_failures_are_retried() {
     assert(client.is_transient("could not connect: connection refused"));
     assert(client.is_transient("error reading: read timeout"));

@@ -126,6 +126,16 @@ pub fn headers(c: Config) -> Map<string, string> {
     if (c.api_key.trim() != "") {
         h.insert("Authorization", "Bearer ${c.api_key}");
     }
+    // Las comunes van al final: un `-H` del usuario manda sobre lo que pone el adaptador.
+    let common = config.common_headers(c);
+    for k in common.keys() {
+        match (get(common, k)) {
+            Option.Some(v) => {
+                h.insert(k, v);
+            },
+            Option.None => { },
+        }
+    }
     h
 }
 

@@ -348,8 +348,13 @@ entorno: `RAYCODE_MCP_CONFIG` y `RAYCODE_MCP=off`.
 Banderas: `-p/--provider`, `-u/--base-url`, `-m/--model`, `-k/--api-key`,
 `-s/--system`, `--max-tokens`, `-t/--temperature`, `--timeout-ms`, `--max-steps`,
 `--no-stream`, `--allow-exec`, `--mcp-config`, `--no-mcp`, `-v/--verbose`,
-`-h/--help`, `-V/--version`. Lo que sobre en la línea de órdenes es la petición de un
-solo turno.
+`-H/--header "Nombre: valor"` (repetible), `-h/--help`, `-V/--version`. Lo que sobre en
+la línea de órdenes es la petición de un solo turno.
+
+Toda petición lleva `User-Agent: raycode/<versión>` y `x-opencode-session`, un id de
+conversación estable que `/reset` renueva: son las dos cosas que un proxy como
+[opencode Go](https://opencode.ai/docs/go/) exige para enrutar y cachear. Una cabecera
+puesta con `-H` manda sobre cualquiera de las del harness.
 
 Entorno: `RAYCODE_PROFILE`, `RAYCODE_BASE_URL`, `RAYCODE_MODEL`, `RAYCODE_API_KEY`,
 `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `RAYCODE_SYSTEM`, `RAYCODE_MAX_TOKENS`,

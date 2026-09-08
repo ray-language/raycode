@@ -207,13 +207,11 @@ fn show_usage(s: agent.Session) {
     let t = s.total;
     let mark = if (usage.is_estimate(t)) { "≈" } else { "" };
     print(ui.bold("usage") + ui.dim(" · ${s.turns} turn(s), ${s.steps} request(s)"));
-    print(
-        "  input   ${mark}${ui.fmt_count(t.input_tokens)} tokens" + if (t.cached_tokens > 0) {
-            " (${ui.fmt_count(t.cached_tokens)} from cache)"
-        } else {
-            ""
-        }
-    );
+    print("  input   ${mark}${ui.fmt_count(t.input_tokens)} tokens" + if (t.cached_tokens > 0) {
+        " (${ui.fmt_count(t.cached_tokens)} from cache)"
+    } else {
+        ""
+    });
     print("  output  ${mark}${ui.fmt_count(t.output_tokens)} tokens");
     print("  total   ${mark}${ui.fmt_count(usage.total_tokens(t))} tokens");
     print(
@@ -488,6 +486,7 @@ fn usage() {
     print("  -m, --model <id>         model id (default depends on the provider)");
     print("  -u, --base-url <url>     endpoint base URL");
     print("  -k, --api-key <key>      API key (or ANTHROPIC_API_KEY / OPENAI_API_KEY)");
+    print("  -H, --header <'N: v'>    extra request header (repeatable; wins over the defaults)");
     print("  -s, --system <text>      system prompt");
     print("      --max-tokens <n>     output token ceiling (default 4096)");
     print("  -t, --temperature <x>    sampling temperature (default 0.2)");

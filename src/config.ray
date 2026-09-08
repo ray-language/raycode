@@ -6,6 +6,8 @@
 /// the release workflow refuses a tag where the two disagree.
 pub const VERSION: string = "0.3.0";
 
+import std/uuid;
+
 /// The wire protocol spoken to the endpoint.
 pub enum Api {
     Anthropic,
@@ -33,6 +35,10 @@ pub struct Config {
     help: bool,
     version: bool,
     mcp_instructions: string,
+    /// A stable id for the conversation, sent as `x-opencode-session`; renewed on `/reset`.
+    session_id: string,
+    /// Extra request headers (`-H "Name: value"`), for proxies that require their own.
+    headers: [string],
 }
 
 /// The protocol name, for the banner.
@@ -91,7 +97,9 @@ fn preset(profile: string) -> Result<Config, string> {
         mcp_config: env_or("RAYCODE_MCP_CONFIG", ""),
         help: false,
         version: false,
-        mcp_instructions: ""
+        mcp_instructions: "",
+        session_id: uuid.uuid_v4(),
+        headers: []
     };
     if (profile == "llama" || profile == "local") {
         base.api = Api.OpenAI;
@@ -186,6 +194,20 @@ pub fn load(argv: [string]) -> Result<Config, string> {
         } else if (a == "--no-mcp") {
             cfg.mcp_enabled = false;
             i = i + 1;
+        } else if (a == "--header" || a == "-H") {
+            let v = value_of(argv, i, a)?;
+            match (v.index_of(":")) {
+                Option.Some(cut) => {
+                    if (cut == 0) {
+                        return Result.Err("bad header '${v}' (expected 'Name: value')");
+                    }
+                    cfg.headers.push(v);
+                },
+                Option.None => {
+                    return Result.Err("bad header '${v}' (expected 'Name: value')");
+                },
+            }
+            i = i + 2;
         } else if (a == "--verbose" || a == "-v") {
             cfg.verbose = true;
             i = i + 1;
@@ -209,6 +231,30 @@ pub fn load(argv: [string]) -> Result<Config, string> {
         return Result.Err("no model: pass --model or set RAYCODE_MODEL");
     }
     Result.Ok(cfg)
+}
+
+/// The headers every request carries regardless of the protocol: the client's own
+/// user agent (proxies such as opencode Go refuse generic ones), the conversation id
+/// (`x-opencode-session`, the routing and cache key those proxies ask for) and the user's
+/// extras from `-H`, which win over everything else.
+pub fn common_headers(c: Config) -> Map<string, string> {
+    var h: Map<string, string> = Map.new();
+    h.insert("User-Agent", "raycode/${VERSION}");
+    h.insert("x-opencode-session", c.session_id);
+    for line in c.headers {
+        match (line.index_of(":")) {
+            Option.Some(cut) => {
+                h.insert(line.substring(0, cut).trim(), line.substring(cut + 1, line.len()).trim());
+            },
+            Option.None => { },
+        }
+    }
+    h
+}
+
+/// A fresh conversation id: what `/reset` does so the proxy stops linking the turns.
+pub fn new_session(c: Config) {
+    c.session_id = uuid.uuid_v4();
 }
 
 /// The system prompt as sent to the model: the user's, followed by whatever the MCP
@@ -236,8 +282,10 @@ pub fn chat_url(c: Config) -> string {
     }
     match (c.api) {
         Api.Anthropic => base + "/v1/messages",
-        Api.OpenAI => if (base.ends_with(
-            "/v1"
-        )) { base + "/chat/completions" } else { base + "/v1/chat/completions" },
+        Api.OpenAI => if (base.ends_with("/v1")) {
+            base + "/chat/completions"
+        } else {
+            base + "/v1/chat/completions"
+        },
     }
 }
