@@ -88,7 +88,7 @@ fn the_picker_filters_case_insensitively_and_keeps_order() {
     assert_eq(picker.matching(items, ""), [0, 1, 2, 3]);
     assert_eq(picker.matching(items, "qwen"), [2]);
     assert_eq(picker.matching(items, "-"), [0, 1, 2, 3]);
-    assert_eq(picker.matching(items, "o"), [0, 1, 2, 3]);
+    assert_eq(picker.matching(items, "o"), [0, 1, 2]);
     assert_eq(picker.matching(items, "zzz").len(), 0);
     // Sin terminal no hay selector: devuelve None y el llamador enseña la lista plana.
     match (picker.pick("models", items, 0)) {
