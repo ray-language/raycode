@@ -16,6 +16,7 @@ import src/mcp;
 import std/json;
 import std/process;
 import net/webserver;
+import src/picker;
 from src/config import Api;
 
 fn no_servers() -> [mcp.Server] {
@@ -38,9 +39,7 @@ fn chat_url_follows_the_protocol() {
 
 @test
 fn a_base_url_with_v1_is_not_doubled() {
-    match (config.load(
-    ["-u", "https://api.groq.com/openai/v1/", "-m", "m"]
-)) {
+    match (config.load(["-u", "https://api.groq.com/openai/v1/", "-m", "m"])) {
         Result.Ok(c) => assert_eq(config.chat_url(c), "https://api.groq.com/openai/v1/chat/completions"),
         Result.Err(e) => panic(e),
     }
@@ -81,6 +80,21 @@ fn help_wins_over_a_missing_model() {
         Result.Err(e) => panic(e),
     };
     assert(manifest.contains("version = \"${config.VERSION}\""));
+}
+
+@test
+fn the_picker_filters_case_insensitively_and_keeps_order() {
+    let items = ["gpt-4o-mini", "claude-sonnet-5", "Qwen2.5-coder", "llama-3.3-70b"];
+    assert_eq(picker.matching(items, ""), [0, 1, 2, 3]);
+    assert_eq(picker.matching(items, "qwen"), [2]);
+    assert_eq(picker.matching(items, "-"), [0, 1, 2, 3]);
+    assert_eq(picker.matching(items, "o"), [0, 1, 2, 3]);
+    assert_eq(picker.matching(items, "zzz").len(), 0);
+    // Sin terminal no hay selector: devuelve None y el llamador enseña la lista plana.
+    match (picker.pick("models", items, 0)) {
+        Option.Some(_) => panic("expected None without a tty"),
+        Option.None => { },
+    }
 }
 
 @test
@@ -260,8 +274,8 @@ fn a_reply_without_usage_is_not_zero_usage() {
         },
     }
     match (anthropic.parse_reply(
-    `{"type":"message","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":0,"output_tokens":0}}`
-)) {
+        `{"type":"message","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":0,"output_tokens":0}}`
+    )) {
         Result.Err(e) => panic(e),
         Result.Ok(r) => assert_eq(r.usage.measured, 0),
     }
@@ -480,8 +494,8 @@ fn a_truncated_answer_is_recognised_in_both_protocols() {
         Result.Ok(r) => assert(message.was_truncated(r.stop_reason)),
     }
     match (anthropic.parse_reply(
-    `{"type":"message","content":[{"type":"text","text":"a medias"}],"stop_reason":"max_tokens"}`
-)) {
+        `{"type":"message","content":[{"type":"text","text":"a medias"}],"stop_reason":"max_tokens"}`
+    )) {
         Result.Err(e) => panic(e),
         Result.Ok(r) => assert(message.was_truncated(r.stop_reason)),
     }
@@ -839,9 +853,7 @@ fn mcp_remote_tools_enter_the_catalogue_and_dispatch() {
         },
         Result.Ok(_) => { },
     }
-    let servers = match (mcp.parse_config(
-        `{"mcpServers":{"raylang":{"command":"ray","args":["mcp"]}}}`
-    )) {
+    let servers = match (mcp.parse_config(`{"mcpServers":{"raylang":{"command":"ray","args":["mcp"]}}}`)) {
         Result.Ok(s) => s,
         Result.Err(e) => panic(e),
     };
@@ -887,9 +899,7 @@ fn mcp_remote_tools_enter_the_catalogue_and_dispatch() {
 
 @test
 fn mcp_a_server_that_cannot_start_is_marked_not_fatal() {
-    let servers = match (mcp.parse_config(
-        `{"mcpServers":{"ghost":{"command":"/nonexistent/mcp-server"}}}`
-    )) {
+    let servers = match (mcp.parse_config(`{"mcpServers":{"ghost":{"command":"/nonexistent/mcp-server"}}}`)) {
         Result.Ok(s) => s,
         Result.Err(e) => panic(e),
     };
@@ -924,9 +934,7 @@ done
 @test
 fn mcp_a_server_that_dies_mid_session_is_reported_and_relaunched() {
     let path = flaky_server_script();
-    let servers = match (mcp.parse_config(
-        `{"mcpServers":{"flaky":{"command":"sh","args":["${path}"]}}}`
-    )) {
+    let servers = match (mcp.parse_config(`{"mcpServers":{"flaky":{"command":"sh","args":["${path}"]}}}`)) {
         Result.Ok(s) => s,
         Result.Err(e) => panic(e),
     };
@@ -965,9 +973,7 @@ fn fake_http_mcp(req: webserver.Request) -> webserver.Response {
     if (req.method == "DELETE") {
         return webserver.text(200, "");
     }
-    if (body.contains(
-        "\"initialize\""
-    )) {
+    if (body.contains("\"initialize\"")) {
         var r = webserver.json_response(
             `{"jsonrpc":"2.0","id":${id},"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"fake"},"instructions":"over http"}}`
         );
@@ -984,9 +990,7 @@ fn fake_http_mcp(req: webserver.Request) -> webserver.Response {
     if (body.contains("notifications/initialized")) {
         return webserver.text(202, "");
     }
-    if (body.contains(
-        "tools/list"
-    )) {
+    if (body.contains("tools/list")) {
         var r = webserver.text(
             200,
             ": keep-alive\n\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":${id},\"result\":{\"tools\":[{\"name\":\"echo\",\"inputSchema\":{\"type\":\"object\"}}]}}\n\n"
@@ -994,9 +998,7 @@ fn fake_http_mcp(req: webserver.Request) -> webserver.Response {
         r.headers.insert("Content-Type", "text/event-stream");
         return r;
     }
-    if (body.contains(
-        "tools/call"
-    )) {
+    if (body.contains("tools/call")) {
         return webserver.json_response(
             `{"jsonrpc":"2.0","id":${id},"result":{"content":[{"type":"text","text":"echo: ${body.len()} bytes, session ${session}"}]}}`
         );
@@ -1048,9 +1050,7 @@ fn mcp_http_config_is_validated() {
         Result.Err(e) => assert(e.contains("url")),
     }
     // Un servidor HTTP que no existe se marca y no aporta nada, como uno stdio que no arranca.
-    let servers = match (mcp.parse_config(
-        `{"mcpServers":{"down":{"url":"http://127.0.0.1:9/mcp"}}}`
-    )) {
+    let servers = match (mcp.parse_config(`{"mcpServers":{"down":{"url":"http://127.0.0.1:9/mcp"}}}`)) {
         Result.Ok(s) => s,
         Result.Err(e) => panic(e),
     };

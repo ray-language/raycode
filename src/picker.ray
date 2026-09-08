@@ -1,0 +1,258 @@
+// Un selector de lista en el terminal: flechas para moverse, Enter para elegir, ESC para
+// salir, y lo que se teclee filtra. Se pinta bajo el prompt en modo crudo y se borra al
+// terminar, así que la conversación queda como estaba.
+import std/term;
+import std/io;
+import std/math;
+import src/ui;
+from std/term import Key;
+
+// Filas de lista como máximo (la ventana se desplaza con la selección).
+const MAX_ROWS: int = 12;
+
+// Cuánto se espera al resto de una secuencia de escape antes de darla por un ESC suelto.
+const ESC_GRACE_MS: int = 25;
+
+// Lo que devuelve una espera de tecla.
+enum Input {
+    Pressed(Key),
+    Done,
+}
+
+// La siguiente tecla, decodificando trozos enteros (pegar o teclear rápido trae varias).
+struct Reader {
+    pending: bytes,
+}
+
+fn next_key(r: Reader) -> Input {
+    while (true) {
+        if (r.pending.len() == 0) {
+            match (io.read_timeout(512, 60000)) {
+                io.ReadResult.Data(chunk) => {
+                    r.pending = chunk;
+                },
+                io.ReadResult.TimedOut => { },
+                io.ReadResult.Eof => {
+                    return Input.Done;
+                },
+            }
+        } else {
+            match (term.decode(r.pending)) {
+                Option.Some(decoded) => {
+                    r.pending = r.pending.sub_bytes(decoded.1, r.pending.len());
+                    return Input.Pressed(decoded.0);
+                },
+                Option.None => match (io.read_timeout(512, ESC_GRACE_MS)) {
+                    io.ReadResult.Data(more) => {
+                        r.pending = r.pending + more;
+                    },
+                    io.ReadResult.TimedOut => {
+                        let alone = r.pending == b"\x1b";
+                        r.pending = b"";
+                        if (alone) {
+                            return Input.Pressed(Key.Esc);
+                        }
+                    },
+                    io.ReadResult.Eof => {
+                        return Input.Done;
+                    },
+                },
+            }
+        }
+    }
+    Input.Done
+}
+
+/// The indexes of `items` containing `filter` (case-insensitive); all of them when empty.
+pub fn matching(items: [string], filter: string) -> [int] {
+    var out: [int] = [];
+    let needle = filter.to_lower();
+    var i = 0;
+    while (i < items.len()) {
+        if (needle == "" || items[i].to_lower().contains(needle)) {
+            out.push(i);
+        }
+        i = i + 1;
+    }
+    out
+}
+
+// El estado que se pinta: título, filtro, la lista filtrada, la selección y la ventana.
+struct View {
+    title: string,
+    items: [string],
+    current: int,
+    filter: string,
+    shown: [int],
+    selected: int,
+    offset: int,
+    drawn: int,
+}
+
+// Pinta el bloque entero, sustituyendo el anterior. Devuelve las filas pintadas.
+fn draw(v: View) {
+    let rows = math.min(MAX_ROWS, math.max(1, ui.height() - 4));
+    if (v.selected < v.offset) {
+        v.offset = v.selected;
+    }
+    if (v.selected >= v.offset + rows) {
+        v.offset = v.selected - rows + 1;
+    }
+    var out = "";
+    if (v.drawn > 0) {
+        out = out + ui.cursor_up(v.drawn);
+    }
+    out = out + "\r" + ui.erase_below();
+    var lines: [string] = [];
+    let count = if (v.shown.len() == v.items.len()) {
+        "${v.items.len()}"
+    } else {
+        "${v.shown.len()} of ${v.items.len()}"
+    };
+    lines.push(ui.bold(v.title) + ui.dim(" · ${count}") + "  " + ui.green("› ") + v.filter);
+    if (v.shown.len() == 0) {
+        lines.push(ui.dim("  (nothing matches)"));
+    }
+    var i = v.offset;
+    while (i < v.shown.len() && i < v.offset + rows) {
+        let index = v.shown[i];
+        let mark = if (index == v.current) { ui.green("● ") } else { ui.dim("○ ") };
+        let label = if (i == v.selected) {
+            ui.inverse(" " + v.items[index] + " ")
+        } else {
+            " " + v.items[index]
+        };
+        lines.push("  " + mark + label);
+        i = i + 1;
+    }
+    if (v.offset > 0 || v.offset + rows < v.shown.len()) {
+        lines.push(
+            ui.dim("  ${v.offset + 1}–${math.min(v.offset + rows, v.shown.len())} · ↑/↓ scroll")
+        );
+    }
+    lines.push(ui.dim("  ↑/↓ move · enter select · esc cancel · type to filter"));
+    for line in lines {
+        out = out + line + "\r\n";
+    }
+    v.drawn = lines.len();
+    ui.write_inline(out);
+}
+
+// Borra el bloque pintado.
+fn clear(v: View) {
+    if (v.drawn > 0) {
+        ui.write_inline(ui.cursor_up(v.drawn) + "\r" + ui.erase_below());
+    }
+    v.drawn = 0;
+}
+
+// Recalcula la lista filtrada, intentando conservar la selección.
+fn refilter(v: View) {
+    let keep = if (v.selected < v.shown.len()) { v.shown[v.selected] } else { -1 };
+    v.shown = matching(v.items, v.filter);
+    v.selected = 0;
+    var i = 0;
+    while (i < v.shown.len()) {
+        if (v.shown[i] == keep) {
+            v.selected = i;
+        }
+        i = i + 1;
+    }
+    v.offset = 0;
+}
+
+// El bucle de teclas, ya en modo crudo.
+fn run(v: View) -> Option<int> {
+    let reader = Reader { pending: b"" };
+    draw(v);
+    while (true) {
+        match (next_key(reader)) {
+            Input.Done => {
+                clear(v);
+                return Option.None;
+            },
+            Input.Pressed(key) => match (key) {
+                Key.Up => {
+                    if (v.shown.len() > 0) {
+                        v.selected = if (v.selected == 0) {
+                            v.shown.len() - 1
+                        } else {
+                            v.selected - 1
+                        };
+                    }
+                },
+                Key.Down => {
+                    if (v.shown.len() > 0) {
+                        v.selected = if (v.selected + 1 >= v.shown.len()) {
+                            0
+                        } else {
+                            v.selected + 1
+                        };
+                    }
+                },
+                Key.Home => {
+                    v.selected = 0;
+                },
+                Key.End => {
+                    v.selected = math.max(0, v.shown.len() - 1);
+                },
+                Key.Enter => {
+                    clear(v);
+                    return if (v.selected < v.shown.len()) {
+                        Option.Some(v.shown[v.selected])
+                    } else {
+                        Option.None
+                    };
+                },
+                Key.Esc => {
+                    clear(v);
+                    return Option.None;
+                },
+                Key.Ctrl(c) => {
+                    if (c == 'c' || c == 'd') {
+                        clear(v);
+                        return Option.None;
+                    }
+                },
+                Key.Backspace => {
+                    if (v.filter.len() > 0) {
+                        v.filter = v.filter.substring(0, v.filter.len() - 1);
+                        refilter(v);
+                    }
+                },
+                Key.Char(c) => {
+                    v.filter = v.filter + to_string(c);
+                    refilter(v);
+                },
+                _ => { },
+            },
+        }
+        draw(v);
+    }
+    Option.None
+}
+
+/// Lets the user choose one of `items` with the keyboard; `current` (an index, or -1) is
+/// marked. Returns the chosen index, or None when the user backs out or there is no
+/// terminal to draw on.
+pub fn pick(title: string, items: [string], current: int) -> Option<int> {
+    if (!ui.interactive() || items.len() == 0) {
+        return Option.None;
+    }
+    let v = View {
+        title: title,
+        items: items,
+        current: current,
+        filter: "",
+        shown: matching(items, ""),
+        selected: math.max(0, current),
+        offset: 0,
+        drawn: 0
+    };
+    match (term.raw(fn() -> Option<int> {
+        run(v)
+    })) {
+        Result.Ok(choice) => choice,
+        Result.Err(_) => Option.None,
+    }
+}

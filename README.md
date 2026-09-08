@@ -242,6 +242,7 @@ a la primera. `-v` traza cada reintento.
 | `/usage` | tokens, peticiones y latencia de la sesión |
 | `/model` | el modelo en uso y el catálogo del endpoint (`GET /v1/models`), con el actual marcado |
 | `/model <id>` | cambia de modelo en caliente, conservando la conversación |
+| `/models` | el catálogo como selector: `↑/↓` mueve, teclear filtra, `Enter` elige, `ESC` cancela |
 | `/tools` | las herramientas expuestas al modelo, con su origen |
 | `/mcp` | los servidores MCP: mandato, herramientas, recursos y último error |
 | `/mcp reload` | reinicia los servidores MCP, conservando la conversación |
@@ -361,6 +362,7 @@ Entorno: `RAYCODE_PROFILE`, `RAYCODE_BASE_URL`, `RAYCODE_MODEL`, `RAYCODE_API_KE
 |---|---|
 | `main.ray` | banner, REPL, órdenes de barra, modo de un solo turno |
 | `src/lineedit.ray` | editor de línea: historial, edición y autocompletado con Tab |
+| `src/picker.ray` | selector de lista con flechas y filtro (`/models`) |
 | `src/spinner.ray` | el indicador de actividad, dibujado por una fibra mientras la otra espera |
 | `src/render.ray` | el AST de `std/markdown` pintado: tema ANSI, tablas, reparto y ritmo |
 | `bin/raycode` | el binario nativo instalado (se reconstruye con `ray build --native`) |
