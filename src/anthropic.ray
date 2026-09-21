@@ -40,6 +40,29 @@ fn arguments_json(raw: string) -> Json {
     }
 }
 
+// La marca que le dice a Anthropic que se quede con todo lo anterior a este bloque y lo
+// cobre a una décima parte la próxima vez. Son pocas y todas al final de algo que no cambia
+// dentro de una conversación: el prompt de sistema y la última herramienta del catálogo.
+fn cached(block: Json) -> Json {
+    match (json.as_object(block)) {
+        Option.Some(table) => {
+            var keys: [string] = [];
+            var values: [Json] = [];
+            for key in table.keys() {
+                keys.push(key);
+                match (table.get(key)) {
+                    Option.Some(v) => values.push(v),
+                    Option.None => values.push(Json.JNull),
+                }
+            }
+            keys.push("cache_control");
+            values.push(obj(["type"], [jstr("ephemeral")]));
+            obj(keys, values)
+        },
+        Option.None => block,
+    }
+}
+
 fn tool_json(t: Tool) -> Json {
     obj(["name", "description", "input_schema"], [jstr(t.name), jstr(t.description), t.schema])
 }
@@ -117,13 +140,21 @@ fn body_of(c: Config, tools: [Tool], history: [Message], streaming: bool) -> str
     var values = [jstr(c.model), Json.JArray(messages), jint(c.max_tokens)];
     let system = config.system_prompt(c);
     if (system.trim() != "") {
+        // Como BLOQUE y marcado: el prompt es el mismo texto en cada petición de la
+        // conversación, y una ronda de herramientas hace otra petición que lo lleva entero
+        // otra vez. Marcado, se cobra a una décima parte a partir de la segunda.
         keys.push("system");
-        values.push(jstr(system));
+        values.push(Json.JArray([cached(obj(["type", "text"], [jstr("text"), jstr(system)]))]));
     }
     if (tools.len() > 0) {
         var decls: [Json] = [];
+        var i = 0;
         for t in tools {
-            decls.push(tool_json(t));
+            i = i + 1;
+            // La marca va al final de lo que no cambia dentro de una conversación, y el
+            // catálogo entero es una sola cosa: basta marcarlo en la última herramienta.
+            let declared = tool_json(t);
+            decls.push(if (i == tools.len()) { cached(declared) } else { declared });
         }
         keys.push("tools");
         values.push(Json.JArray(decls));

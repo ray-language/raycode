@@ -7,6 +7,7 @@
 pub const VERSION: string = "0.3.1";
 
 import std/uuid;
+import std/keychain;
 import src/permissions;
 import src/modes;
 import src/ui;
@@ -15,6 +16,9 @@ import src/ui;
 pub enum Api {
     Anthropic,
     OpenAI,
+    /// OpenAI's other API, `POST /v1/responses`, where its newer reasoning and code models
+    /// are served. Same host and same key as Chat Completions, different shape.
+    Responses,
 }
 
 /// Everything the harness needs to talk to one model.
@@ -47,6 +51,14 @@ pub struct Config {
     /// What the turn is for, and whether the tools that change things are on the table:
     /// `ask`, `plan`, `agent` or `debug`.
     mode: string,
+    /// Where the key came from: "flag", "env", "keychain" or "" when there is none. What is
+    /// said about a key is where it came from, never the key.
+    key_source: string,
+    /// What this endpoint calls the output ceiling in the OpenAI protocol: `max_tokens`,
+    /// which is what everyone copied, or `max_completion_tokens`, which is what OpenAI's
+    /// newer models insist on and what refusing the old name is about. Guessed from the
+    /// host and corrected by the provider itself the first time it complains.
+    max_tokens_field: string,
     /// The programs the user has lent the agent — by program, not by command line. Grows
     /// while the session runs, whenever the answer to "run this?" is "always".
     allowed_programs: [string],
@@ -60,6 +72,7 @@ pub fn api_name(a: Api) -> string {
     match (a) {
         Api.Anthropic => "anthropic",
         Api.OpenAI => "openai-compatible",
+        Api.Responses => "openai-responses",
     }
 }
 
@@ -81,6 +94,17 @@ fn allowed_from_env() -> [string] {
         }
     }
     out
+}
+
+/// The name everyone copied, and the one OpenAI's newer models want instead.
+pub const MAX_TOKENS: string = "max_tokens";
+
+pub const MAX_COMPLETION_TOKENS: string = "max_completion_tokens";
+
+/// Which of the two an endpoint is most likely to take. A guess, and only a first one: the
+/// provider corrects it by complaining, and the harness believes the provider.
+pub fn token_field_for(base_url: string) -> string {
+    if (base_url.contains("api.openai.com")) { MAX_COMPLETION_TOKENS } else { MAX_TOKENS }
 }
 
 const DEFAULT_SYSTEM: string = "You are raycode, a concise coding assistant running in a terminal harness. Use the available tools to inspect and edit the workspace before answering. Keep answers short and concrete.";
@@ -138,27 +162,39 @@ fn preset(profile: string) -> Result<Config, string> {
         allowed_programs: allowed_from_env(),
         allowed_tools: [],
         mode: env_or("RAYCODE_MODE", modes.AGENT),
+        key_source: "",
+        max_tokens_field: MAX_TOKENS
     };
     if (profile == "llama" || profile == "local") {
         base.api = Api.OpenAI;
         base.base_url = env_or("RAYCODE_BASE_URL", "http://127.0.0.1:8080");
         base.api_key = env_or("RAYCODE_API_KEY", "");
+        base.key_source = if (base.api_key == "") { "" } else { "env" };
         base.model = env_or("RAYCODE_MODEL", "local-model");
         Result.Ok(base)
     } else if (profile == "openai") {
         base.api = Api.OpenAI;
         base.base_url = env_or("RAYCODE_BASE_URL", "https://api.openai.com");
         base.api_key = env_or("OPENAI_API_KEY", env_or("RAYCODE_API_KEY", ""));
+        base.key_source = if (base.api_key == "") { "" } else { "env" };
         base.model = env_or("RAYCODE_MODEL", "gpt-4o-mini");
+        Result.Ok(base)
+    } else if (profile == "responses" || profile == "codex") {
+        base.api = Api.Responses;
+        base.base_url = env_or("RAYCODE_BASE_URL", "https://api.openai.com");
+        base.api_key = env_or("OPENAI_API_KEY", env_or("RAYCODE_API_KEY", ""));
+        base.key_source = if (base.api_key == "") { "" } else { "env" };
+        base.model = env_or("RAYCODE_MODEL", "gpt-5");
         Result.Ok(base)
     } else if (profile == "anthropic" || profile == "claude") {
         base.api = Api.Anthropic;
         base.base_url = env_or("RAYCODE_BASE_URL", "https://api.anthropic.com");
         base.api_key = env_or("ANTHROPIC_API_KEY", env_or("RAYCODE_API_KEY", ""));
+        base.key_source = if (base.api_key == "") { "" } else { "env" };
         base.model = env_or("RAYCODE_MODEL", "claude-opus-5");
         Result.Ok(base)
     } else {
-        Result.Err("unknown profile '${profile}' (use: llama, openai, anthropic)")
+        Result.Err("unknown profile '${profile}' (use: llama, openai, responses, anthropic)")
     }
 }
 
@@ -203,6 +239,7 @@ pub fn load(argv: [string]) -> Result<Config, string> {
             i = i + 2;
         } else if (a == "--api-key" || a == "-k") {
             cfg.api_key = value_of(argv, i, a)?;
+            cfg.key_source = "flag";
             i = i + 2;
         } else if (a == "--system" || a == "-s") {
             cfg.system = value_of(argv, i, a)?;
@@ -297,10 +334,52 @@ pub fn load(argv: [string]) -> Result<Config, string> {
     }
     // Los argumentos sueltos son una petición de un solo turno (modo no interactivo).
     cfg.prompt = positional.join(" ");
+    // El nombre del tope se decide con la URL ya fijada por las banderas, no con la del
+    // perfil: apuntar `-p openai` a otro sitio es exactamente el caso que esto tiene que ver.
+    cfg.max_tokens_field = token_field_for(cfg.base_url);
+    // Y si nadie ha dado clave, se mira el llavero del sistema (raylang 1.27.3): una clave
+    // guardada una vez no hay que volver a exportarla en cada shell.
+    if (cfg.api_key.trim() == "") {
+        match (stored_key(cfg.profile)) {
+            Option.Some(key) => {
+                cfg.api_key = key;
+                cfg.key_source = "keychain";
+            },
+            Option.None => { },
+        }
+    }
     if (cfg.model.trim() == "") {
         return Result.Err("no model: pass --model or set RAYCODE_MODEL");
     }
     Result.Ok(cfg)
+}
+
+/// What the keychain files raycode's keys under: one service, one account per profile, so
+/// the Anthropic key and the OpenAI one do not sit on top of each other.
+pub const KEYCHAIN_SERVICE: string = "raycode";
+
+/// The key stored for a profile, or None — including when there is no keychain to be had.
+/// A machine without a secret service is a machine that keeps its key in the environment,
+/// not one that cannot use raycode, so a failure here is quiet.
+pub fn stored_key(profile: string) -> Option<string> {
+    match (keychain.get(KEYCHAIN_SERVICE, profile)) {
+        Result.Ok(found) => match (found) {
+            Option.Some(key) => if (key.trim() == "") { Option.None } else { Option.Some(key) },
+            Option.None => Option.None,
+        },
+        Result.Err(_e) => Option.None,
+    }
+}
+
+/// Puts a profile's key in the system keychain — Keychain on macOS, the Secret Service on
+/// Linux, the Credential Manager on Windows.
+pub fn store_key(profile: string, key: string) -> Result<int, string> {
+    keychain.set(KEYCHAIN_SERVICE, profile, key)
+}
+
+/// Takes it out again. True when there was one.
+pub fn forget_key(profile: string) -> Result<bool, string> {
+    keychain.delete(KEYCHAIN_SERVICE, profile)
 }
 
 /// The headers every request carries regardless of the protocol: the client's own
@@ -356,7 +435,9 @@ pub fn chat_url(c: Config) -> string {
         base = base.substring(0, base.len() - 1);
     }
     // Si el usuario ya apuntó a la ruta completa, se respeta tal cual.
-    if (base.contains("/chat/completions") || base.contains("/v1/messages")) {
+    if (base.contains("/chat/completions")
+        || base.contains("/v1/messages")
+        || base.ends_with("/responses")) {
         return base;
     }
     match (c.api) {
@@ -365,6 +446,11 @@ pub fn chat_url(c: Config) -> string {
             base + "/chat/completions"
         } else {
             base + "/v1/chat/completions"
+        },
+        Api.Responses => if (base.ends_with("/v1")) {
+            base + "/responses"
+        } else {
+            base + "/v1/responses"
         },
     }
 }

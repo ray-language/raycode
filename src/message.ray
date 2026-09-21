@@ -46,10 +46,11 @@ pub fn tool_result(call_id: string, text: string) -> Message {
 }
 
 /// True when the endpoint cut the answer at the token ceiling instead of letting the
-/// model finish — `length` in the OpenAI protocol, `max_tokens` in Anthropic's. It is the
+/// model finish — `length` in Chat Completions, `max_output_tokens` in the Responses API,
+/// `max_tokens` in Anthropic's. It is the
 /// difference between "the model said this" and "the model was mid-sentence".
 pub fn was_truncated(stop_reason: string) -> bool {
-    stop_reason == "length" || stop_reason == "max_tokens"
+    stop_reason == "length" || stop_reason == "max_tokens" || stop_reason == "max_output_tokens"
 }
 
 /// What one provider round-trip produced: the assistant turn, what the endpoint reported

@@ -1,0 +1,402 @@
+// Adaptador de la OTRA API de OpenAI: `POST /v1/responses`.
+//
+// Chat Completions es la que copió todo el mundo y la que habla cualquier servidor
+// compatible; Responses es donde OpenAI pone sus modelos nuevos —los de razonamiento y los
+// de código—, y pedir esos en `chat/completions` devuelve un 404. Mismo host, misma clave,
+// forma distinta.
+//
+// Y no es Chat Completions con otra ruta: el prompt de sistema es `instructions`, los
+// mensajes son ítems de `input` cuyo contenido va tipado (`input_text` a la ida,
+// `output_text` a la vuelta), una herramienta es plana en vez de envuelta en un objeto
+// `function`, y la respuesta de una herramienta es un ítem propio en lugar de un mensaje
+// con un rol. Se mantiene aparte de `src/openai` en vez de compartir un constructor con
+// ramas dentro, porque cada una de esas diferencias es un sitio donde el constructor
+// compartido habría tenido que bifurcarse igual.
+import std/json;
+from std/json import Json;
+from src/config import Config;
+import src/config;
+from src/message import Message, ToolCall, Reply;
+import src/message;
+from src/tools import Tool;
+from src/usage import Usage;
+
+fn jstr(s: string) -> Json {
+    Json.JStr(s)
+}
+
+fn jint(n: int) -> Json {
+    Json.JNum(n as float)
+}
+
+fn obj(keys: [string], values: [Json]) -> Json {
+    var m: Map<string, Json> = Map.new();
+    var i = 0;
+    while (i < keys.len() && i < values.len()) {
+        m.insert(keys[i], values[i]);
+        i = i + 1;
+    }
+    Json.JObject(m)
+}
+
+// Los argumentos de una llamada, que el modelo manda como texto JSON. Vacío es un objeto
+// vacío: la API rechaza una cadena en blanco.
+fn arguments_of(c: ToolCall) -> string {
+    if (c.arguments.trim() == "") { "{}" } else { c.arguments }
+}
+
+// La declaración de una herramienta: plana, sin el envoltorio `function` de Chat.
+fn tool_json(t: Tool) -> Json {
+    obj(
+        ["type", "name", "description", "parameters"],
+        [jstr("function"), jstr(t.name), jstr(t.description), t.schema]
+    )
+}
+
+// El historial como lista de ítems de `input`.
+fn input_items(history: [Message]) -> [Json] {
+    var items: [Json] = [];
+    for m in history {
+        if (m.role == "tool") {
+            // La respuesta de una herramienta es un ítem, no un mensaje: no tiene rol.
+            items.push(
+                obj(
+                    ["type", "call_id", "output"],
+                    [jstr("function_call_output"), jstr(m.tool_call_id), jstr(m.text)]
+                )
+            );
+            continue;
+        }
+        if (m.role == "assistant") {
+            if (m.text != "") {
+                items.push(
+                    obj(
+                        ["role", "content"],
+                        [
+                            jstr("assistant"),
+                            Json.JArray(
+                                [obj(["type", "text"], [jstr("output_text"), jstr(m.text)])]
+                            )
+                        ]
+                    )
+                );
+            }
+            for c in m.tool_calls {
+                items.push(
+                    obj(
+                        ["type", "call_id", "name", "arguments"],
+                        [jstr("function_call"), jstr(c.id), jstr(c.name), jstr(arguments_of(c))]
+                    )
+                );
+            }
+            continue;
+        }
+        items.push(
+            obj(
+                ["role", "content"],
+                [
+                    jstr("user"),
+                    Json.JArray([obj(["type", "text"], [jstr("input_text"), jstr(m.text)])])
+                ]
+            )
+        );
+    }
+    items
+}
+
+/// The request body for one turn.
+pub fn build_body(c: Config, tools: [Tool], history: [Message]) -> string {
+    body_of(c, tools, history, false)
+}
+
+/// The same body, asking the endpoint to stream the answer.
+pub fn build_stream_body(c: Config, tools: [Tool], history: [Message]) -> string {
+    body_of(c, tools, history, true)
+}
+
+fn body_of(c: Config, tools: [Tool], history: [Message], streaming: bool) -> string {
+    var keys = ["model", "input", "max_output_tokens"];
+    var values = [jstr(c.model), Json.JArray(input_items(history)), jint(c.max_tokens)];
+    let system = config.system_prompt(c);
+    if (system.trim() != "") {
+        keys.push("instructions");
+        values.push(jstr(system));
+    }
+    if (c.temperature >= 0.0) {
+        keys.push("temperature");
+        values.push(Json.JNum(c.temperature));
+    }
+    if (tools.len() > 0) {
+        var decls: [Json] = [];
+        for t in tools {
+            decls.push(tool_json(t));
+        }
+        keys.push("tools");
+        values.push(Json.JArray(decls));
+    }
+    if (streaming) {
+        keys.push("stream");
+        values.push(Json.JBool(true));
+    }
+    json.stringify(obj(keys, values))
+}
+
+/// The HTTP headers this endpoint takes: the same bearer token as Chat Completions.
+pub fn headers(c: Config) -> Map<string, string> {
+    var h: Map<string, string> = Map.new();
+    h.insert("Content-Type", "application/json");
+    h.insert("Accept", "application/json");
+    if (c.api_key.trim() != "") {
+        h.insert("Authorization", "Bearer ${c.api_key}");
+    }
+    // Las comunes van al final: un `-H` del usuario manda sobre lo que pone el adaptador.
+    let common = config.common_headers(c);
+    for k in common.keys() {
+        match (get(common, k)) {
+            Option.Some(v) => {
+                h.insert(k, v);
+            },
+            Option.None => { },
+        }
+    }
+    h
+}
+
+fn string_or(j: Json, key: string, fallback: string) -> string {
+    match (json.get_string(j, key)) {
+        Option.Some(s) => s,
+        Option.None => fallback,
+    }
+}
+
+fn int_or(j: Json, key: string, fallback: int) -> int {
+    match (json.get_int(j, key)) {
+        Option.Some(n) => n,
+        Option.None => fallback,
+    }
+}
+
+// Los tokens de prompt servidos desde caché, anidados igual que en Chat.
+fn cached_of(u: Json) -> int {
+    match (json.member(u, "input_tokens_details")) {
+        Option.Some(d) => int_or(d, "cached_tokens", 0),
+        Option.None => 0,
+    }
+}
+
+// El uso de una respuesta completa. Aquí los nombres son `input_tokens`/`output_tokens`,
+// no los `prompt_tokens`/`completion_tokens` de Chat.
+fn usage_of(root: Json) -> Usage {
+    var used = Usage {
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_tokens: 0,
+        requests: 1,
+        latency_ms: 0,
+        measured: 0,
+        estimated: 0
+    };
+    match (json.member(root, "usage")) {
+        Option.Some(u) => {
+            used.input_tokens = int_or(u, "input_tokens", 0);
+            used.output_tokens = int_or(u, "output_tokens", 0);
+            used.cached_tokens = cached_of(u);
+            if (used.input_tokens > 0 || used.output_tokens > 0) {
+                used.measured = 1;
+            }
+        },
+        Option.None => { },
+    }
+    used
+}
+
+/// Parses a non-streamed response into the harness's canonical reply.
+pub fn parse_reply(body: string) -> Result<Reply, string> {
+    let root = json.parse(body)?;
+    // Un error puede llegar con 200: se detecta por el campo, no por el estado.
+    match (json.member(root, "error")) {
+        Option.Some(e) => if (!json.is_null(e)) {
+            return Result.Err(string_or(e, "message", json.stringify(e)));
+        },
+        Option.None => { },
+    }
+    var text = "";
+    var calls: [ToolCall] = [];
+    let output = match (json.get_array(root, "output")) {
+        Option.Some(list) => list,
+        Option.None => {
+            return Result.Err("the response has no \"output\" list");
+        },
+    };
+    for item in output {
+        let kind = string_or(item, "type", "");
+        if (kind == "function_call") {
+            calls.push(
+                ToolCall {
+                    id: string_or(item, "call_id", ""),
+                    name: string_or(item, "name", ""),
+                    arguments: string_or(item, "arguments", "")
+                }
+            );
+        } else if (kind == "message") {
+            match (json.get_array(item, "content")) {
+                Option.Some(parts) => {
+                    for part in parts {
+                        if (string_or(part, "type", "") == "output_text") {
+                            text = text + string_or(part, "text", "");
+                        }
+                    }
+                },
+                Option.None => { },
+            }
+        }
+    }
+    // `status` es lo que dice si la respuesta se completó o se quedó corta; la razón de un
+    // corte vive dentro de `incomplete_details`.
+    var stop = string_or(root, "status", "");
+    if (stop == "incomplete") {
+        match (json.member(root, "incomplete_details")) {
+            Option.Some(d) => {
+                stop = string_or(d, "reason", stop);
+            },
+            Option.None => { },
+        }
+    }
+    Result.Ok(
+        Reply {
+            message: message.assistant(text, calls),
+            usage: usage_of(root),
+            stop_reason: stop,
+            model: string_or(root, "model", "")
+        }
+    )
+}
+
+// ------------------------------------------------------------------- streaming
+
+/// What a stream builds up as its events land. Unlike Chat's, this protocol names its
+/// events, and every event carries the index of the output item it is about.
+pub struct Assembly {
+    text: string,
+    calls: [ToolCall],
+    usage: Usage,
+    stop_reason: string,
+    model: string,
+    done: bool,
+}
+
+/// An empty assembly.
+pub fn assembly() -> Assembly {
+    let none: [ToolCall] = [];
+    Assembly {
+        text: "",
+        calls: none,
+        usage: Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_tokens: 0,
+            requests: 1,
+            latency_ms: 0,
+            measured: 0,
+            estimated: 0
+        },
+        stop_reason: "",
+        model: "",
+        done: false
+    }
+}
+
+// La llamada en la posición `index`, creándola si es la primera vez que se ve. Los
+// argumentos llegan partidos en trozos arbitrarios, así que se van concatenando.
+fn slot(a: Assembly, index: int) -> ToolCall {
+    while (a.calls.len() <= index) {
+        a.calls.push(ToolCall { id: "", name: "", arguments: "" });
+    }
+    a.calls[index]
+}
+
+/// Absorbs one `data:` payload and returns the text it produced — what there is to paint
+/// right now. Anything unrecognised is ignored: a stream is not a place to be strict.
+pub fn absorb(a: Assembly, data: string) -> string {
+    let payload = data.trim();
+    if (payload == "[DONE]") {
+        a.done = true;
+        return "";
+    }
+    let root = match (json.parse(payload)) {
+        Result.Ok(j) => j,
+        Result.Err(_) => {
+            return "";
+        },
+    };
+    let event = string_or(root, "type", "");
+    if (event == "response.output_text.delta") {
+        let piece = string_or(root, "delta", "");
+        a.text = a.text + piece;
+        return piece;
+    }
+    if (event == "response.output_item.added") {
+        match (json.member(root, "item")) {
+            Option.Some(item) => {
+                if (string_or(item, "type", "") == "function_call") {
+                    let target = slot(a, int_or(root, "output_index", 0));
+                    // `call_id` es lo que hay que responder; el `id` del ítem no lo es.
+                    target.id = string_or(item, "call_id", "");
+                    target.name = string_or(item, "name", "");
+                    target.arguments = target.arguments + string_or(item, "arguments", "");
+                }
+            },
+            Option.None => { },
+        }
+        return "";
+    }
+    if (event == "response.function_call_arguments.delta") {
+        let target = slot(a, int_or(root, "output_index", 0));
+        target.arguments = target.arguments + string_or(root, "delta", "");
+        return "";
+    }
+    if (event == "response.completed" || event == "response.incomplete") {
+        a.done = true;
+        match (json.member(root, "response")) {
+            Option.Some(response) => {
+                if (a.model == "") {
+                    a.model = string_or(response, "model", "");
+                }
+                a.usage = usage_of(response);
+                a.stop_reason = if (event == "response.incomplete") {
+                    match (json.member(response, "incomplete_details")) {
+                        Option.Some(d) => string_or(d, "reason", "incomplete"),
+                        Option.None => "incomplete",
+                    }
+                } else {
+                    "completed"
+                };
+            },
+            Option.None => { },
+        }
+        return "";
+    }
+    if (event == "response.failed" || event == "error") {
+        a.done = true;
+        a.stop_reason = "error";
+        return "";
+    }
+    ""
+}
+
+/// The assembled reply. Calls with no id get one: a tool result has to answer something.
+pub fn assembled(a: Assembly) -> Reply {
+    var i = 0;
+    while (i < a.calls.len()) {
+        if (a.calls[i].id == "") {
+            a.calls[i].id = "call_${i}";
+        }
+        i = i + 1;
+    }
+    Reply {
+        message: message.assistant(a.text, a.calls),
+        usage: a.usage,
+        stop_reason: a.stop_reason,
+        model: a.model
+    }
+}

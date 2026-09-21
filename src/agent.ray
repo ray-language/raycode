@@ -674,7 +674,18 @@ fn run_turn(s: Session, width: int, raw: bool) -> Result<Usage, string> {
                 return Result.Ok(turn);
             },
             Step.Failed(e) => {
-                return Result.Err(e);
+                // Una queja del proveedor sobre un PARÁMETRO se arregla aquí, en la fibra
+                // que tiene la configuración de verdad, y el paso se rehace. Hacerlo dentro
+                // de la petición no serviría: allí la sesión es una copia, y el arreglo se
+                // perdería con la fibra — que es justo lo que pasaba, una vez por petición.
+                let fixed = client.adapt_to(s.config, e);
+                if (fixed == "") {
+                    return Result.Err(e);
+                }
+                say(ui.dim("· ${fixed}"), raw);
+                step = step - 1;
+                s.steps = s.steps - 1;
+                continue;
             },
             Step.Ready(reply) => {
                 turn = usage.add(turn, reply.usage);

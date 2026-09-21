@@ -93,14 +93,16 @@ fn body_of(c: Config, tools: [Tool], history: [Message], streaming: bool) -> str
     for m in history {
         messages.push(message_json(m));
     }
-    var keys = ["model", "messages", "max_tokens", "temperature", "stream"];
-    var values = [
-        jstr(c.model),
-        Json.JArray(messages),
-        jint(c.max_tokens),
-        Json.JNum(c.temperature),
-        Json.JBool(streaming)
-    ];
+    // El tope de salida, con el nombre que quiera este endpoint (ver `config.MAX_TOKENS`),
+    // y la temperatura solo si hay una que pedir: los modelos de razonamiento de OpenAI
+    // rechazan cualquiera que no sea la suya, y una temperatura que el harness se inventó
+    // es una respuesta distinta de la que habría dado el proveedor.
+    var keys = ["model", "messages", c.max_tokens_field, "stream"];
+    var values = [jstr(c.model), Json.JArray(messages), jint(c.max_tokens), Json.JBool(streaming)];
+    if (c.temperature >= 0.0) {
+        keys.push("temperature");
+        values.push(Json.JNum(c.temperature));
+    }
     if (tools.len() > 0) {
         var decls: [Json] = [];
         for t in tools {

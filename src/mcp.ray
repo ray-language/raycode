@@ -269,7 +269,11 @@ fn parse_server(name: string, spec: Json) -> Result<Server, string> {
     };
     let link: Channel<Request> = Channel.new();
     Result.Ok(
-        Server { name: name, command: command, args: arguments, dir: dir, env: environment, url: url, headers: extra_headers, enabled: !disabled, note: if (disabled) { "disabled in the configuration" } else { "" }, tool_count: 0, instructions: "", resources: [], link: link, running: false }
+        Server { name: name, command: command, args: arguments, dir: dir, env: environment, url: url, headers: extra_headers, enabled: !disabled, note: if (disabled) {
+            "disabled in the configuration"
+        } else {
+            ""
+        }, tool_count: 0, instructions: "", resources: [], link: link, running: false }
     )
 }
 
@@ -531,10 +535,6 @@ pub fn parse_tools(result: Json) -> Result<[RemoteTool], string> {
     Result.Ok(tools)
 }
 
-// ---------------------------------------------------------------- transporte
-
-// El proceso vivo, propiedad exclusiva del actor: el handle, lo leído y aún no consumido
-// de su stdout, la siguiente `id` y lo que declaró al inicializarse.
 // Lo que el servidor declara en `annotations.readOnlyHint`. Ausente = no.
 fn read_only_hint(item: Json) -> bool {
     match (json.member(item, "annotations")) {
@@ -546,6 +546,10 @@ fn read_only_hint(item: Json) -> bool {
     }
 }
 
+// ---------------------------------------------------------------- transporte
+
+// El proceso vivo, propiedad exclusiva del actor: el handle, lo leído y aún no consumido
+// de su stdout, la siguiente `id` y lo que declaró al inicializarse.
 struct Live {
     proc: process.Proc,
     pending: bytes,
@@ -665,7 +669,11 @@ fn write_line(live: Live, text: string) -> Result<int, string> {
 // Lanza el proceso y hace el apretón de manos.
 fn launch(s: Server, timeout_ms: int) -> Result<Live, string> {
     var command = process.cmd(s.command, s.args).stdin_pipe();
-    command = command.dir(if (s.dir.trim() == "") { ui.workspace() } else { ui.resolve_path(s.dir) });
+    command = command.dir(if (s.dir.trim() == "") {
+        ui.workspace()
+    } else {
+        ui.resolve_path(s.dir)
+    });
     for k in s.env.keys() {
         match (get(s.env, k)) {
             Option.Some(v) => {
@@ -820,12 +828,14 @@ fn header_of(headers: Map<string, string>, name: string) -> string {
 
 // ¿Es esta línea la respuesta con `id`? Devuelve su `result` o el error del protocolo.
 fn reply_with_id(text: string, id: int) -> Option<Result<Json, string>> {
-    match (json.parse(
-    text.trim()
-)) {
+    match (json.parse(text.trim())) {
         Result.Err(_) => Option.None,
         Result.Ok(reply) => match (json.get_int(reply, "id")) {
-            Option.Some(found) => if (found == id) { Option.Some(result_of(reply)) } else { Option.None },
+            Option.Some(found) => if (found == id) {
+                Option.Some(result_of(reply))
+            } else {
+                Option.None
+            },
             Option.None => Option.None,
         },
     }
@@ -929,9 +939,7 @@ fn post(
         );
     }
     if (!kind.contains("text/event-stream")) {
-        outcome = match (from_utf8(
-            acc
-        )) {
+        outcome = match (from_utf8(acc)) {
             Result.Err(_) => Result.Err("the reply is not UTF-8"),
             Result.Ok(text) => match (reply_with_id(text, id)) {
                 Option.Some(found) => found,
@@ -998,12 +1006,12 @@ fn disconnect_http(s: Server, web: Web) {
         return;
     }
     match (http.request_bytes(
-    "DELETE",
-    s.url,
-    b"",
-    http_headers(s, web.session_id),
-    STOP_GRACE_MS
-)) {
+        "DELETE",
+        s.url,
+        b"",
+        http_headers(s, web.session_id),
+        STOP_GRACE_MS
+    )) {
         Result.Ok(_) => { },
         Result.Err(_) => { },
     }
@@ -1125,12 +1133,7 @@ pub fn discover(s: Server, timeout_ms: int) -> Result<[RemoteTool], string> {
         return Result.Ok([]);
     }
     start(s);
-    let outcome: Result<[RemoteTool], string> = match (ask(
-        s,
-        "tools/list",
-        empty_object(),
-        timeout_ms
-    )) {
+    let outcome: Result<[RemoteTool], string> = match (ask(s, "tools/list", empty_object(), timeout_ms)) {
         Result.Ok(answer) => {
             s.instructions = answer.instructions;
             parse_tools(answer.result)

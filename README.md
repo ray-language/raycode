@@ -109,8 +109,12 @@ se suman las herramientas de cualquier [servidor MCP](#servidores-mcp).
 
 ## Qué hace
 
-- **Tres perfiles, un bucle.** `llama` y `openai` hablan `POST /v1/chat/completions`;
-  `anthropic` habla `POST /v1/messages` con bloques de contenido. El agente no sabe
+- **Cuatro perfiles, tres protocolos, un bucle.** `llama` y `openai` hablan
+  `POST /v1/chat/completions`; `anthropic` habla `POST /v1/messages` con bloques de
+  contenido; `responses` (o `codex`) habla `POST /v1/responses`, que es donde OpenAI sirve
+  sus modelos de razonamiento y de código —pedirlos en `chat/completions` da un 404— y que
+  no es la misma API con otra ruta: el prompt es `instructions`, los mensajes son ítems con
+  contenido tipado y la respuesta de una herramienta es un ítem sin rol. El agente no sabe
   con cuál está hablando: los adaptadores traducen desde y hacia el modelo canónico
   de `src/message.ray`.
 - **Respuesta en directo.** Con `stream: true` el texto se pinta según llega, por
@@ -179,6 +183,31 @@ se suman las herramientas de cualquier [servidor MCP](#servidores-mcp).
   dejar una frase a medias que parece completa. El tope por defecto es 4096 y se sube
   en caliente con `/set max-tokens N` (o `RAYCODE_MAX_TOKENS`). El cuerpo HTTP en sí
   no tiene tope: se lee hasta EOF.
+- **Un error del proveedor, contado en palabras.** Un 401 dice que la clave fue rechazada y
+  dónde mirarla; un 404 en un chat nombra el modelo, porque casi nunca es la URL —el catálogo
+  salió de la misma base— sino un modelo que no se sirve en ese endpoint; el resto lleva el
+  mensaje del propio proveedor. En vez del JSON crudo que venía por el cable. Lo que sí se va
+  a reintentar conserva su `HTTP nnn`, que es por donde se reconoce.
+- **El parámetro que el modelo no acepta, corregido solo.** Los dos protocolos han crecido
+  por debajo de la misma URL: los modelos nuevos de OpenAI rechazan `max_tokens` y quieren
+  `max_completion_tokens`, y los de razonamiento no aceptan ninguna temperatura que no sea la
+  suya. El nombre se adivina por el host, pero la adivinanza no manda: cuando el proveedor se
+  queja de un parámetro —un 400 que no es un fallo de red ni un error del usuario— el harness
+  le hace caso, arregla la petición, lo dice por stderr y la reenvía, sin gastar reintento.
+- **La clave, en el llavero del sistema.** Se busca en la bandera, luego en el entorno y
+  luego en el llavero (Keychain en macOS, el Secret Service en Linux, el Credential Manager
+  en Windows; `std/keychain`, de raylang 1.27.3). `/key` dice de dónde salió la que hay
+  —nunca la clave, solo sus cuatro últimos caracteres y su origen—, `/key save` la guarda y
+  `/key forget` la borra. Una máquina sin llavero sigue funcionando con el entorno, y no se
+  la avisa de nada.
+- **Caché de prompt en Anthropic.** El prompt de sistema y el catálogo de herramientas son
+  el mismo texto en cada petición, y una ronda de herramientas hace otra petición que lo
+  lleva entero otra vez: van marcados con `cache_control`, así que a partir de la segunda se
+  cobran a una décima parte. Las lecturas de caché salen en `/usage`.
+- **Un límite de tasa se espera como lo pidió el proveedor.** `Retry-After`, y si no viene,
+  los segundos que el propio cuerpo dice en palabras («Please try again in 9.882s») — que es
+  el único sitio donde lo dice un 429 en streaming. Con un tope de un minuto: un límite que
+  se abre dentro de una hora no es algo que dormir.
 - **Uso a la vista.** Cada turno cierra con tokens de entrada/salida, lecturas de
   caché, número de peticiones, latencia y tokens/s; `/usage` da el acumulado y una
   línea `counts` que dice de dónde salen las cifras. Un endpoint que no devuelve
@@ -287,6 +316,10 @@ a la primera. `-v` traza cada reintento.
 | `/resource <uri>` | mete un recurso MCP en la conversación (el modelo tiene `read_resource`) |
 | `/set [clave valor]` | mandos en caliente: `max-tokens`, `temperature`, `max-steps`, `timeout-ms` (sin argumentos, los muestra junto a `stream`) |
 | `/system <texto>` | reemplaza el prompt de sistema (vacío: lo muestra) |
+| `/key [save\|forget]` | de dónde viene la clave; la guarda en el llavero del sistema o la borra |
+| `/mode [nombre]` | para qué es el turno: `ask`, `plan`, `agent`, `debug` (sin argumento, los lista) |
+| `/autonomy [nivel]` | cuánto corre sin un sí: `ask`, `edits`, `auto` (sin argumento, los lista con el actual marcado) |
+| `/allow [programa]` | los programas prestados al agente (sin argumento, los lista) |
 | `/reset` | olvida la conversación, conserva los totales |
 | `/verbose` | traza peticiones y respuestas en stderr |
 | `/exit` (o `/quit`) | salir (igual que Ctrl-D) |

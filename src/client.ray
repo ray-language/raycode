@@ -13,6 +13,7 @@ from src/message import Message, Reply;
 from src/tools import Tool;
 import src/anthropic;
 import src/openai;
+import src/responses;
 
 /// What the endpoint says about the model actually loaded behind it.
 pub struct ModelInfo {
@@ -34,6 +35,7 @@ fn headers_of(c: Config) -> Map<string, string> {
     match (c.api) {
         Api.Anthropic => anthropic.headers(c),
         Api.OpenAI => openai.headers(c),
+        Api.Responses => responses.headers(c),
     }
 }
 
@@ -41,6 +43,7 @@ fn body_of(c: Config, tools: [Tool], history: [Message]) -> string {
     match (c.api) {
         Api.Anthropic => anthropic.build_body(c, tools, history),
         Api.OpenAI => openai.build_body(c, tools, history),
+        Api.Responses => responses.build_body(c, tools, history),
     }
 }
 
@@ -48,6 +51,7 @@ fn parse_of(c: Config, body: string) -> Result<Reply, string> {
     match (c.api) {
         Api.Anthropic => anthropic.parse_reply(body),
         Api.OpenAI => openai.parse_reply(body),
+        Api.Responses => responses.parse_reply(body),
     }
 }
 
@@ -63,10 +67,12 @@ pub fn send(c: Config, tools: [Tool], history: [Message]) -> Result<Reply, strin
                 return outcome;
             },
             Result.Err(e) => {
-                if (attempt >= MAX_ATTEMPTS || !is_transient(
-                    e
-                )) {
-                    return if (attempt > 1) { Result.Err("${e} (after ${attempt} attempts)") } else { outcome };
+                if (attempt >= MAX_ATTEMPTS || !is_transient(e)) {
+                    return if (attempt > 1) {
+                        Result.Err("${e} (after ${attempt} attempts)")
+                    } else {
+                        outcome
+                    };
                 }
                 back_off(c, attempt, e);
                 attempt = attempt + 1;
@@ -79,13 +85,59 @@ pub fn send(c: Config, tools: [Tool], history: [Message]) -> Result<Reply, strin
 /// How many times a request is tried before its failure is reported.
 pub const MAX_ATTEMPTS: int = 3;
 
+/// What a provider's complaint about a PARAMETER changes in the configuration, or "" when
+/// the complaint is about something else. Returns what was changed, for the trace.
+///
+/// It is applied by the TURN and not by the request, and that is the whole point: a request
+/// runs in a fiber of its own, and a fiber gets a COPY of the session — a fix written there
+/// would be thrown away with the fiber, and every request would pay the same refusal again.
+///
+/// A 400 of this kind is not a network hiccup and retrying it unchanged would only get it
+/// again — but it is also not the user's mistake. The two protocols have grown apart
+/// underneath the same URL: OpenAI's newer models refuse `max_tokens` and want
+/// `max_completion_tokens`, and the reasoning ones refuse any temperature but their own.
+/// Nothing here can know which model is which, and the provider says so plainly, so the
+/// harness believes it, fixes the request, and sends it again — once. Each fix only ever
+/// applies once, because it changes the very thing it is looking for.
+pub fn adapt_to(c: Config, error: string) -> string {
+    if (error.contains("'${config.MAX_TOKENS}'")
+        && error.contains(config.MAX_COMPLETION_TOKENS)
+        && c.max_tokens_field == config.MAX_TOKENS) {
+        c.max_tokens_field = config.MAX_COMPLETION_TOKENS;
+        return "the output ceiling goes as '${config.MAX_COMPLETION_TOKENS}' for this model";
+    }
+    // Y al revés: un servidor compatible más viejo no conoce el nombre nuevo. Ojo con el
+    // mensaje de OpenAI, que NOMBRA LOS DOS ("'max_tokens' … Use 'max_completion_tokens'"):
+    // si esta regla lo tomara por suyo, las dos se turnarían para siempre.
+    if (error.contains("'${config.MAX_COMPLETION_TOKENS}'")
+        && unsupported(error)
+        && !error.contains("Use '${config.MAX_COMPLETION_TOKENS}'")
+        && c.max_tokens_field == config.MAX_COMPLETION_TOKENS) {
+        c.max_tokens_field = config.MAX_TOKENS;
+        return "the output ceiling goes as '${config.MAX_TOKENS}' for this model";
+    }
+    if (error.contains("'temperature'") && unsupported(error) && c.temperature >= 0.0) {
+        c.temperature = 0.0 - 1.0;
+        return "this model takes no temperature; the request goes without one";
+    }
+    ""
+}
+
+// Las palabras con las que los dos protocolos dicen «ese parámetro aquí no».
+fn unsupported(error: string) -> bool {
+    error.contains("nsupported")
+        || error.contains("not supported")
+        || error.contains("does not support")
+}
+
 /// True for the failures worth retrying: no connection, a dropped or timed-out read, a 429
 /// or a 5xx (overload, gateway). A 4xx other than 429 is the request's fault, not the
 /// network's, and comes back at once.
 pub fn is_transient(e: string) -> bool {
-    if (e.starts_with(
-        "could not connect"
-    ) || e.starts_with("error sending") || e.starts_with("error reading") || e.contains("read timeout")) {
+    if (e.starts_with("could not connect")
+        || e.starts_with("error sending")
+        || e.starts_with("error reading")
+        || e.contains("read timeout")) {
         return true;
     }
     if (e.starts_with("HTTP ")) {
@@ -93,23 +145,196 @@ pub fn is_transient(e: string) -> bool {
             Option.Some(n) => n,
             Option.None => 0,
         };
-        return code == 429 || code == 408 || code >= 500 && code <= 599;
+        return is_retryable(code);
     }
     false
 }
 
-// La espera entre intentos: 1 s, 2 s, 4 s.
+// La espera entre intentos: lo que haya pedido el proveedor, y si no ha pedido nada, 1 s,
+// 2 s, 4 s. Un límite por minuto sabe mejor que nosotros cuándo se abre.
 fn back_off(c: Config, attempt: int, why: string) {
-    var wait = 1000;
-    var i = 1;
-    while (i < attempt) {
-        wait = wait * 2;
-        i = i + 1;
+    var wait = asked_wait(why);
+    if (wait <= 0) {
+        wait = 1000;
+        var i = 1;
+        while (i < attempt) {
+            wait = wait * 2;
+            i = i + 1;
+        }
     }
     if (c.verbose) {
         eprint("retrying in ${wait}ms (attempt ${attempt} failed: ${short(why)})");
     }
     time.sleep(wait);
+}
+
+/// How long the provider asked to be left alone, in milliseconds, or 0 when it asked for
+/// nothing. `Retry-After` is the header for it; the two vendors also put it in words in the
+/// body ("Please try again in 9.882s"), which is the only place a streaming 429 says it.
+/// Capped, because a limit that resets in an hour is not something to sleep through.
+pub fn retry_after_ms(headers: Map<string, string>, body: string) -> int {
+    var seconds = 0.0;
+    // El cliente HTTP normaliza a minúsculas, pero un proveedor puede escribirla como
+    // quiera y una cabecera perdida es una espera inventada.
+    let asked = match (get(headers, "retry-after")) {
+        Option.Some(v) => v,
+        Option.None => match (get(headers, "Retry-After")) {
+            Option.Some(v) => v,
+            Option.None => "",
+        },
+    };
+    match (parse_float(asked.trim())) {
+        Option.Some(n) => {
+            seconds = n;
+        },
+        Option.None => { },
+    }
+    if (seconds <= 0.0) {
+        seconds = seconds_in_message(body);
+    }
+    if (seconds <= 0.0) {
+        return 0;
+    }
+    // Un pelo más de lo pedido: un límite medido por minuto no se abre en el instante exacto.
+    var ms = ((seconds * 1000.0) as int) + 500;
+    if (ms < 1000) {
+        ms = 1000;
+    }
+    if (ms > MAX_RATE_WAIT_MS) {
+        ms = MAX_RATE_WAIT_MS;
+    }
+    ms
+}
+
+/// Cuánto se acepta esperar por un límite de tasa antes de darse por vencido.
+pub const MAX_RATE_WAIT_MS: int = 60000;
+
+// Los segundos de "Please try again in 9.882s", o 0.0 si el mensaje no dice tal cosa.
+fn seconds_in_message(message: string) -> float {
+    let mark = "try again in ";
+    let at = match (message.index_of(mark)) {
+        Option.Some(i) => i,
+        Option.None => {
+            return 0.0;
+        },
+    };
+    let rest = message.substring(at + mark.len(), message.len());
+    var number = "";
+    var reading = true;
+    for ch in rest.chars() {
+        if (reading) {
+            let code = char_code(ch);
+            if ((code >= 48 && code <= 57) || (ch == '.' && !number.contains("."))) {
+                number = number + "${ch}";
+            } else {
+                reading = false;
+            }
+        }
+    }
+    match (parse_float(number)) {
+        Option.Some(n) => n,
+        Option.None => 0.0,
+    }
+}
+
+// Lo que el proveedor pidió, sacado del error que se lleva de un intento al siguiente. El
+// error es texto —es lo que cruza el `Result`— así que la espera viaja dentro de él con una
+// marca, en vez de por un canal aparte que habría que hilar por tres funciones.
+const WAIT_MARK: string = " [retry-after ";
+
+fn asked_wait(why: string) -> int {
+    match (why.index_of(WAIT_MARK)) {
+        Option.Some(at) => {
+            let rest = why.substring(at + WAIT_MARK.len(), why.len());
+            match (rest.index_of("ms]")) {
+                Option.Some(end) => parse_int(rest.substring(0, end)).unwrap_or(0),
+                Option.None => 0,
+            }
+        },
+        Option.None => 0,
+    }
+}
+
+// El error de un estado que no es 2xx, con la espera que haya pedido el proveedor pegada
+// detrás para que el reintento la respete.
+fn rate_limited(
+    c: Config,
+    status: int,
+    url: string,
+    headers: Map<string, string>,
+    body: string
+) -> string {
+    let wait = retry_after_ms(headers, body);
+    let asked = if (wait > 0) { "${WAIT_MARK}${wait}ms]" } else { "" };
+    // Lo que se va a reintentar conserva el prefijo "HTTP nnn": es por donde `is_transient`
+    // reconoce que merece otro intento. Lo demás se cuenta en palabras.
+    if (is_retryable(status)) {
+        let theirs = error_message(body);
+        let said = if (theirs == "") { short(body) } else { theirs };
+        return "HTTP ${status} from ${url}: ${said}${asked}";
+    }
+    explain_status(status, body, url, c.model)
+}
+
+/// True for the statuses worth another try: too many requests, a timeout at the gateway, or
+/// the provider having a bad minute.
+pub fn is_retryable(status: int) -> bool {
+    status == 429 || status == 408 || (status >= 500 && status <= 599)
+}
+
+/// The message in an error body, if it has the shape either protocol uses —
+/// `{"error": {"message": …}}` or `{"error": "…"}` — and "" otherwise.
+pub fn error_message(body: string) -> string {
+    let root = match (json.parse(body)) {
+        Result.Ok(j) => j,
+        Result.Err(_e) => {
+            return "";
+        },
+    };
+    match (json.member(root, "error")) {
+        Option.Some(e) => match (json.as_string(e)) {
+            Option.Some(text) => text,
+            Option.None => match (json.get_string(e, "message")) {
+                Option.Some(text) => text,
+                Option.None => "",
+            },
+        },
+        Option.None => match (json.get_string(root, "message")) {
+            Option.Some(text) => text,
+            Option.None => "",
+        },
+    }
+}
+
+/// A status the provider chose, in words, and not the JSON it came wrapped in.
+///
+/// The provider's own message says the most — a refused key, a model that does not exist, a
+/// model that exists but not at this endpoint — so it is preferred to any guess from here.
+/// What this adds is the part the provider CANNOT know: which of the things raycode was
+/// told is the suspect.
+pub fn explain_status(status: int, body: string, url: string, model: string) -> string {
+    let theirs = error_message(body);
+    if (status == 401 || status == 403) {
+        return if (theirs == "") {
+            "the key was refused (HTTP ${status}) — check --api-key, the environment variable, or /key"
+        } else {
+            "the key was refused: ${theirs}"
+        };
+    }
+    if (status == 404) {
+        // Un 404 en un chat rara vez es la URL: el catálogo que llenó el selector salió de
+        // la misma base. Casi siempre es el modelo — los de razonamiento y los de código se
+        // sirven en otro sitio que `chat/completions`, que es lo que `-p responses` arregla.
+        if (model != "") {
+            if (theirs != "") {
+                return "'${model}': ${theirs}";
+            }
+            return "nothing answers at ${url} (HTTP 404): '${model}' may not be served at this endpoint. Try another model, or -p responses, or check the base URL.";
+        }
+        let said = if (theirs == "") { "" } else { " (${theirs})" };
+        return "nothing answers at ${url} (HTTP 404)${said}: is the base URL right?";
+    }
+    if (theirs != "") { "HTTP ${status}: ${theirs}" } else { "HTTP ${status} from ${url}" }
 }
 
 fn send_once(c: Config, tools: [Tool], history: [Message]) -> Result<Reply, string> {
@@ -126,7 +351,7 @@ fn send_once(c: Config, tools: [Tool], history: [Message]) -> Result<Reply, stri
         eprint("← ${response.status} in ${elapsed}ms (${text.len()} chars)");
     }
     if (response.status < 200 || response.status >= 300) {
-        return Result.Err("HTTP ${response.status} from ${url}: ${short(text)}");
+        return Result.Err(rate_limited(c, response.status, url, response.headers, text));
     }
     var reply = parse_of(c, text)?;
     reply.usage.latency_ms = elapsed;
@@ -163,6 +388,7 @@ fn stream_body_of(c: Config, tools: [Tool], history: [Message]) -> string {
     match (c.api) {
         Api.Anthropic => anthropic.build_stream_body(c, tools, history),
         Api.OpenAI => openai.build_stream_body(c, tools, history),
+        Api.Responses => responses.build_stream_body(c, tools, history),
     }
 }
 
@@ -193,10 +419,12 @@ pub fn send_stream(
                 return outcome;
             },
             Result.Err(e) => {
-                if (painted || attempt >= MAX_ATTEMPTS || !is_transient(
-                    e
-                )) {
-                    return if (attempt > 1) { Result.Err("${e} (after ${attempt} attempts)") } else { outcome };
+                if (painted || attempt >= MAX_ATTEMPTS || !is_transient(e)) {
+                    return if (attempt > 1) {
+                        Result.Err("${e} (after ${attempt} attempts)")
+                    } else {
+                        outcome
+                    };
                 }
                 back_off(c, attempt, e);
                 attempt = attempt + 1;
@@ -221,11 +449,12 @@ fn send_stream_once(
     let stream = http.stream_with("POST", url, body.to_bytes(), headers_of(c), c.timeout_ms)?;
     if (stream.status < 200 || stream.status >= 300) {
         let detail = drain(stream);
-        return Result.Err("HTTP ${stream.status} from ${url}: ${short(detail)}");
+        return Result.Err(rate_limited(c, stream.status, url, stream.headers, detail));
     }
     var reply = match (c.api) {
         Api.Anthropic => stream_anthropic(stream, paint),
         Api.OpenAI => stream_openai(stream, paint),
+        Api.Responses => stream_responses(stream, paint),
     }?;
     http.stream_close(stream);
     reply.usage.latency_ms = time.monotonic() - started;
@@ -264,6 +493,58 @@ fn drain(stream: http.Stream) -> string {
         Result.Ok(t) => t,
         Result.Err(_) => "",
     }
+}
+
+// El mismo bucle para la API Responses: sus eventos vienen con nombre, pero el ensamblador
+// los despacha por su campo `type`, así que aquí no cambia nada salvo de quién es el
+// ensamblador.
+fn stream_responses(stream: http.Stream, paint: fn(string) -> unit) -> Result<Reply, string> {
+    let a = responses.assembly();
+    var acc: bytes = b"";
+    var whole: bytes = b"";
+    var events = 0;
+    var reading = true;
+    while (reading) {
+        var decoding = true;
+        while (decoding) {
+            match (sse.decode(acc)) {
+                Option.Some(decoded) => {
+                    acc = acc.sub_bytes(decoded.1, acc.len());
+                    events = events + 1;
+                    let piece = responses.absorb(a, decoded.0.data);
+                    if (piece != "") {
+                        paint(piece);
+                    }
+                },
+                Option.None => {
+                    decoding = false;
+                },
+            }
+        }
+        match (http.stream_read(stream)) {
+            Result.Ok(chunk) => match (chunk) {
+                Option.Some(part) => {
+                    acc = acc + part;
+                    whole = whole + part;
+                },
+                Option.None => {
+                    reading = false;
+                },
+            },
+            Result.Err(e) => {
+                return Result.Err("error reading the stream: ${e}");
+            },
+        }
+    }
+    if (events == 0) {
+        let body = from_utf8(whole)?;
+        let reply = responses.parse_reply(body)?;
+        if (reply.message.text != "") {
+            paint(reply.message.text);
+        }
+        return Result.Ok(reply);
+    }
+    Result.Ok(responses.assembled(a))
 }
 
 fn stream_openai(stream: http.Stream, paint: fn(string) -> unit) -> Result<Reply, string> {
@@ -528,10 +809,7 @@ fn probe_openai(c: Config) -> Option<ModelInfo> {
 
 // Anthropic: `/v1/models/{id}` da el nombre visible y la ventana de entrada.
 fn probe_anthropic(c: Config) -> Option<ModelInfo> {
-    match (get_json(
-    c,
-    root_url(c) + "/v1/models/" + c.model
-)) {
+    match (get_json(c, root_url(c) + "/v1/models/" + c.model)) {
         Option.None => Option.None,
         Option.Some(j) => Option.Some(
             ModelInfo {
@@ -552,5 +830,7 @@ pub fn probe(c: Config) -> Option<ModelInfo> {
             Option.Some(i) => Option.Some(i),
             Option.None => probe_openai(c),
         },
+        // Responses vive en el mismo host que Chat y publica el mismo catálogo.
+        Api.Responses => probe_openai(c),
     }
 }

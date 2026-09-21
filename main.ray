@@ -51,6 +51,9 @@ fn banner(s: agent.Session) {
         ui.dim("sampling ") + "max_tokens ${c.max_tokens} · temperature ${ui.fmt_float(c.temperature, 2)} · max_steps ${c.max_steps} · ${flow}"
     );
     print(ui.dim("workspace ") + paths.root());
+    if (c.key_source != "") {
+        print(ui.dim("key      from the ${c.key_source}"));
+    }
     let mode = modes.find(c.mode);
     print(ui.dim("mode     ") + mode.label + ui.dim(" · ${mode.note}"));
     let level = permissions.find(c.autonomy);
@@ -184,6 +187,7 @@ fn commands() -> [string] {
         "/mcp",
         "/resource",
         "/system",
+        "/key",
         "/mode",
         "/autonomy",
         "/allow",
@@ -208,6 +212,7 @@ fn help() {
     print("  /resource <uri>    put an MCP resource into the conversation");
     print("  /system <text>     replace the system prompt (empty: show it)");
     print("  /reset             forget the transcript, keep the session totals");
+    print("  /key [save|forget] where the API key comes from; save it in the system keychain");
     print("  /mode [<name>]     what the turn is for: ask, plan, agent, debug");
     print("  /autonomy [<lvl>]  how much runs without a yes: ask, edits, auto");
     print("  /allow [<prog>]    the programs lent to the agent; with a name, lend one more");
@@ -371,6 +376,59 @@ fn show_tools(s: agent.Session) {
     }
 }
 
+// La clave: de dónde viene y dónde se guarda. Lo que se dice de una clave es su origen y
+// su forma, nunca la clave.
+fn manage_key(s: agent.Session, rest: string) {
+    let c = s.config;
+    if (rest == "save") {
+        if (c.api_key.trim() == "") {
+            print(
+                ui.red("! ")
+                    + "there is no key to save (pass --api-key or set the environment variable)"
+            );
+            return;
+        }
+        match (config.store_key(c.profile, c.api_key)) {
+            Result.Ok(_) => {
+                c.key_source = "keychain";
+                print(ui.dim("the key for '${c.profile}' is in the system keychain"));
+            },
+            Result.Err(e) => print(ui.red("! ") + "the keychain refused it: ${e}"),
+        }
+        return;
+    }
+    if (rest == "forget") {
+        match (config.forget_key(c.profile)) {
+            Result.Ok(had) => print(ui.dim(if (had) {
+                "the stored key for '${c.profile}' is gone"
+            } else {
+                "there was no stored key for '${c.profile}'"
+            })),
+            Result.Err(e) => print(ui.red("! ") + "the keychain refused it: ${e}"),
+        }
+        return;
+    }
+    if (rest != "") {
+        print(ui.red("! ") + "usage: /key [save|forget]");
+        return;
+    }
+    if (c.api_key.trim() == "") {
+        print(ui.dim("no key · this endpoint is being used without one"));
+        return;
+    }
+    // Los últimos cuatro caracteres bastan para reconocer cuál de tus claves es.
+    let shown = if (c.api_key.len() > 4) {
+        "…" + c.api_key.substring(c.api_key.len() - 4, c.api_key.len())
+    } else {
+        "…"
+    };
+    let where = if (c.key_source == "") { "unknown" } else { c.key_source };
+    print(ui.dim("key ") + shown + ui.dim(" · from the ${where}"));
+    if (c.key_source != "keychain") {
+        print(ui.dim("  /key save puts it in the system keychain, so it is there next time"));
+    }
+}
+
 // El modo, en caliente. Cambiarlo no borra la conversación: preguntar algo en `ask` y
 // luego pasar a `agent` para que lo arregle es la forma normal de usar esto.
 fn set_mode(s: agent.Session, rest: string) {
@@ -481,6 +539,8 @@ fn command(s: agent.Session, line: string) -> bool {
             agent.reset(s);
             print(ui.dim("system prompt replaced; transcript cleared"));
         }
+    } else if (name == "/key") {
+        manage_key(s, rest);
     } else if (name == "/mode") {
         set_mode(s, rest);
     } else if (name == "/autonomy") {
@@ -545,7 +605,7 @@ fn repl(s: agent.Session, editor: lineedit.Editor) -> int {
     0
 }
 
-const USAGE_LINE: string = "usage: raycode [-p llama|openai|anthropic] [-m model] [-u base-url] [-k key] [--autonomy ask|edits|auto] [--allow-exec] [--mcp-config file | --no-mcp] [prompt…]";
+const USAGE_LINE: string = "usage: raycode [-p llama|openai|responses|anthropic] [-m model] [-u base-url] [-k key] [--autonomy ask|edits|auto] [--allow-exec] [--mcp-config file | --no-mcp] [prompt…]";
 
 // La ayuda de línea de órdenes (`--help`): banderas, entorno y órdenes del REPL.
 fn usage() {
@@ -562,8 +622,10 @@ fn usage() {
     print("");
     print(ui.bold("options"));
     print(
-        "  -p, --provider <name>    llama (default, llama.cpp at 127.0.0.1:8080), openai, anthropic"
+        "  -p, --provider <name>    llama (default, llama.cpp at 127.0.0.1:8080), openai, responses"
     );
+    print("                           (OpenAI's /v1/responses, for its reasoning and code");
+    print("                           models), anthropic");
     print("  -m, --model <id>         model id (default depends on the provider)");
     print("  -u, --base-url <url>     endpoint base URL");
     print("  -k, --api-key <key>      API key (or ANTHROPIC_API_KEY / OPENAI_API_KEY)");
@@ -600,6 +662,7 @@ fn usage() {
     print("  raycode                                   chat with llama.cpp");
     print("  raycode -p anthropic                      chat with the Anthropic API");
     print("  raycode -p openai -m gpt-4o-mini          chat with OpenAI");
+    print("  raycode -p responses -m gpt-5             chat over OpenAI's Responses API");
     print("  raycode --allow-exec \"summarise this repo\"  one request, with the shell");
     print("");
     print(ui.dim("Inside the session, /help lists the commands."));
