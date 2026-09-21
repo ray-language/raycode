@@ -1,0 +1,560 @@
+// El color de un bloque de código, para el terminal.
+//
+// Es un resaltador DELIBERADAMENTE pequeño: cuatro papeles —comentario, cadena, número y
+// palabra clave— y un perfil por familia de lenguaje. No es un analizador; no sabe de
+// ámbitos, ni de tipos, ni de qué es una llamada. Para lo que sirve un bloque de código en
+// una conversación de terminal —ver de un vistazo dónde acaba una cadena, que eso de ahí es
+// un comentario, que esa palabra es una clave— llega de sobra, y cabe en un archivo.
+//
+// Lo que NO se hizo, y por qué: ray-sublime tiene un resaltador de verdad, sobre gramáticas
+// `.sublime-syntax`, con sus 484 archivos de sintaxis y sus esquemas de color. Empotrar eso
+// en una CLI para pintar diez líneas de shell sería pagar un motor entero por un adorno.
+//
+// El estado (dentro de un comentario de bloque, dentro de una cadena) CRUZA de una línea a
+// la siguiente, y por eso se pinta línea a línea llevándolo a mano en vez de pintar el
+// bloque entero de una vez: un tramo de color que cruzara un salto de línea se rompería al
+// insertar el `│ ` del marco, y el comentario perdería el color a partir de la segunda.
+import src/ui;
+
+/// One language's surface, which is all this needs to know about it.
+pub struct Language {
+    /// The fence labels that pick it.
+    names: [string],
+    /// What starts a comment that runs to the end of the line.
+    line_comment: [string],
+    /// What opens and closes a comment that spans lines; "" for a language without them.
+    block_open: string,
+    block_close: string,
+    /// The quote characters that open a string.
+    quotes: [string],
+    /// Whether a backslash escapes the next character inside a string.
+    escapes: bool,
+    keywords: [string],
+}
+
+/// Where a line left the scanner, so the next one starts where it ended.
+pub struct Scan {
+    in_block: bool,
+    /// The quote that is still open, or "" outside a string.
+    quote: string,
+}
+
+pub fn fresh() -> Scan {
+    Scan { in_block: false, quote: "" }
+}
+
+// Las familias. Un lenguaje que no esté aquí se pinta con el perfil genérico, que solo
+// conoce cadenas, números y las dos marcas de comentario más comunes — y eso, en un
+// lenguaje que no las use, no pinta nada de más porque tampoco aparecen.
+fn languages() -> [Language] {
+    [
+        Language {
+            names: ["ray", "raylang", "rust", "rs"],
+            line_comment: ["//"],
+            block_open: "/*",
+            block_close: "*/",
+            quotes: ["\"", "`"],
+            escapes: true,
+            keywords: [
+                "fn",
+                "let",
+                "var",
+                "const",
+                "if",
+                "else",
+                "while",
+                "for",
+                "in",
+                "match",
+                "return",
+                "break",
+                "continue",
+                "struct",
+                "enum",
+                "pub",
+                "import",
+                "from",
+                "spawn",
+                "send",
+                "recv",
+                "select",
+                "as",
+                "true",
+                "false",
+                "impl",
+                "trait",
+                "mut",
+                "use",
+                "type",
+                "where",
+                "unit",
+                "panic"
+            ]
+        },
+        Language {
+            names: ["js", "javascript", "ts", "typescript", "jsx", "tsx", "java", "c", "cpp", "c++", "cs"],
+            line_comment: ["//"],
+            block_open: "/*",
+            block_close: "*/",
+            quotes: ["\"", "'", "`"],
+            escapes: true,
+            keywords: [
+                "function",
+                "const",
+                "let",
+                "var",
+                "if",
+                "else",
+                "for",
+                "while",
+                "return",
+                "class",
+                "extends",
+                "new",
+                "this",
+                "import",
+                "export",
+                "from",
+                "default",
+                "async",
+                "await",
+                "try",
+                "catch",
+                "finally",
+                "throw",
+                "typeof",
+                "instanceof",
+                "switch",
+                "case",
+                "break",
+                "continue",
+                "null",
+                "undefined",
+                "true",
+                "false",
+                "interface",
+                "type",
+                "public",
+                "private",
+                "static",
+                "void",
+                "int",
+                "struct"
+            ]
+        },
+        Language {
+            names: ["py", "python"],
+            line_comment: ["#"],
+            block_open: "",
+            block_close: "",
+            quotes: ["\"", "'"],
+            escapes: true,
+            keywords: [
+                "def",
+                "class",
+                "if",
+                "elif",
+                "else",
+                "for",
+                "while",
+                "in",
+                "return",
+                "import",
+                "from",
+                "as",
+                "with",
+                "try",
+                "except",
+                "finally",
+                "raise",
+                "pass",
+                "lambda",
+                "yield",
+                "async",
+                "await",
+                "not",
+                "and",
+                "or",
+                "is",
+                "None",
+                "True",
+                "False",
+                "self",
+                "global",
+                "nonlocal",
+                "assert",
+                "del"
+            ]
+        },
+        Language {
+            names: ["go", "golang"],
+            line_comment: ["//"],
+            block_open: "/*",
+            block_close: "*/",
+            quotes: ["\"", "`"],
+            escapes: true,
+            keywords: [
+                "func",
+                "var",
+                "const",
+                "if",
+                "else",
+                "for",
+                "range",
+                "return",
+                "type",
+                "struct",
+                "interface",
+                "package",
+                "import",
+                "go",
+                "defer",
+                "chan",
+                "select",
+                "switch",
+                "case",
+                "default",
+                "break",
+                "continue",
+                "map",
+                "nil",
+                "true",
+                "false",
+                "error",
+                "string",
+                "int",
+                "bool"
+            ]
+        },
+        Language {
+            names: ["sh", "bash", "zsh", "shell", "console", "terminal"],
+            line_comment: ["#"],
+            block_open: "",
+            block_close: "",
+            quotes: ["\"", "'"],
+            escapes: true,
+            keywords: [
+                "if",
+                "then",
+                "elif",
+                "else",
+                "fi",
+                "for",
+                "in",
+                "do",
+                "done",
+                "while",
+                "case",
+                "esac",
+                "function",
+                "return",
+                "export",
+                "local",
+                "echo",
+                "cd",
+                "set",
+                "source",
+                "exit"
+            ]
+        },
+        Language {
+            names: ["json"],
+            line_comment: [],
+            block_open: "",
+            block_close: "",
+            quotes: ["\""],
+            escapes: true,
+            keywords: ["true", "false", "null"]
+        },
+        Language {
+            names: ["toml", "ini", "yaml", "yml", "conf"],
+            line_comment: ["#"],
+            block_open: "",
+            block_close: "",
+            quotes: ["\"", "'"],
+            escapes: true,
+            keywords: ["true", "false", "null", "yes", "no"]
+        },
+        Language {
+            names: ["sql"],
+            line_comment: ["--"],
+            block_open: "/*",
+            block_close: "*/",
+            quotes: ["'", "\""],
+            escapes: false,
+            keywords: [
+                "select",
+                "from",
+                "where",
+                "insert",
+                "into",
+                "values",
+                "update",
+                "set",
+                "delete",
+                "create",
+                "table",
+                "index",
+                "drop",
+                "alter",
+                "join",
+                "left",
+                "right",
+                "inner",
+                "outer",
+                "on",
+                "group",
+                "order",
+                "by",
+                "having",
+                "limit",
+                "offset",
+                "and",
+                "or",
+                "not",
+                "null",
+                "as",
+                "distinct",
+                "union"
+            ]
+        }
+    ]
+}
+
+// El perfil de quien no tiene perfil: lo que casi cualquier archivo de configuración o de
+// código comparte, y nada más.
+fn generic() -> Language {
+    Language {
+        names: [],
+        line_comment: ["#", "//"],
+        block_open: "",
+        block_close: "",
+        quotes: ["\"", "'"],
+        escapes: true,
+        keywords: []
+    }
+}
+
+/// True for the fence labels that mean "this is not code": painting a block of plain output
+/// would only invent meaning that is not there.
+pub fn is_plain(label: string) -> bool {
+    let name = label.trim().to_lower();
+    // Markdown entra aquí: su `#` es un título, no un comentario, y el perfil genérico lo
+    // apagaría entero.
+    name == "text"
+        || name == "txt"
+        || name == "plain"
+        || name == "output"
+        || name == "log"
+        || name == "md"
+        || name == "markdown"
+        || name == ""
+}
+
+/// True for the one "language" that is really a format: a patch, where the colour belongs to
+/// whole lines rather than to what is in them.
+pub fn is_diff(label: string) -> bool {
+    let name = label.trim().to_lower();
+    name == "diff" || name == "patch"
+}
+
+fn language_for(label: string) -> Language {
+    let name = label.trim().to_lower();
+    for l in languages() {
+        if (l.names.contains(name)) {
+            return l;
+        }
+    }
+    generic()
+}
+
+/// The lines of `code`, painted for `label`. The state is carried from one line to the next,
+/// so a string or a comment that spans lines keeps its colour all the way down.
+pub fn paint_lines(label: string, lines: [string]) -> [string] {
+    if (is_plain(label)) {
+        return lines;
+    }
+    if (is_diff(label)) {
+        var out: [string] = [];
+        for line in lines {
+            out.push(paint_diff(line));
+        }
+        return out;
+    }
+    let l = language_for(label);
+    let state = fresh();
+    var out: [string] = [];
+    for line in lines {
+        out.push(paint_line(l, line, state));
+    }
+    out
+}
+
+// Un parche: el color es de la línea entera, y lo que importa es qué lado es.
+fn paint_diff(line: string) -> string {
+    if (line.starts_with("+++") || line.starts_with("---")) {
+        return ui.bold(line);
+    }
+    if (line.starts_with("@@")) {
+        return ui.cyan(line);
+    }
+    if (line.starts_with("+")) {
+        return ui.green(line);
+    }
+    if (line.starts_with("-")) {
+        return ui.red(line);
+    }
+    line
+}
+
+// --- el barrido ---
+
+fn is_digit(c: string) -> bool {
+    let code = char_code(c[0]);
+    code >= 48 && code <= 57
+}
+
+// Lo que puede ir dentro de un identificador: letras, dígitos, guion bajo, y el guion medio
+// que usan las claves de configuración.
+fn is_word(c: string) -> bool {
+    let code = char_code(c[0]);
+    (code >= 48 && code <= 57)
+        || (code >= 65 && code <= 90)
+        || (code >= 97 && code <= 122)
+        || c == "_"
+        || c == "-"
+        || c == "$"
+}
+
+fn starts_word(c: string) -> bool {
+    let code = char_code(c[0]);
+    (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || c == "_" || c == "$"
+}
+
+// ¿Empieza `line` por `mark` en la posición `at`?
+fn at_mark(line: string, at: int, mark: string) -> bool {
+    mark != "" && at + mark.len() <= line.len() && line.substring(at, at + mark.len()) == mark
+}
+
+// Dónde acaba una cadena abierta en `from` con la comilla `quote`, y si llegó a cerrar en
+// esta línea. El final es el índice PASADA la comilla de cierre, o el final de la línea.
+fn string_end(l: Language, line: string, from: int, quote: string) -> (int, bool) {
+    var j = from;
+    while (j < line.len()) {
+        let here = line.substring(j, j + 1);
+        if (l.escapes && here == "\\" && j + 1 < line.len()) {
+            j = j + 2;
+        } else if (here == quote) {
+            return (j + 1, true);
+        } else {
+            j = j + 1;
+        }
+    }
+    (line.len(), false)
+}
+
+/// One line, painted, with `st` moved on to where the line ended.
+pub fn paint_line(l: Language, line: string, st: Scan) -> string {
+    var out = "";
+    var plain = "";
+    var i = 0;
+    while (i < line.len()) {
+        let c = line.substring(i, i + 1);
+        // Dentro de un comentario de bloque: todo es comentario hasta que cierre.
+        if (st.in_block) {
+            // Si no cierra en esta línea, sigue abierto en la siguiente. (Que el final del
+            // texto coincida con el final de la línea no significa que haya cerrado: eso
+            // dejaba el comentario abierto sin color a partir de la segunda línea.)
+            match (line.substring(i, line.len()).index_of(l.block_close)) {
+                Option.Some(at) => {
+                    let close = i + at + l.block_close.len();
+                    out = out + ui.dim(line.substring(i, close));
+                    st.in_block = false;
+                    i = close;
+                },
+                Option.None => {
+                    out = out + ui.dim(line.substring(i, line.len()));
+                    i = line.len();
+                },
+            }
+            continue;
+        }
+        // Dentro de una cadena que venía de la línea anterior: hasta la comilla que la
+        // cierre, saltándose lo escapado.
+        if (st.quote != "") {
+            let ends = string_end(l, line, i, st.quote);
+            out = out + ui.green(line.substring(i, ends.0));
+            if (ends.1) {
+                st.quote = "";
+            }
+            i = ends.0;
+            continue;
+        }
+        var handled = false;
+        // Un comentario de línea se come el resto y termina el trabajo.
+        for mark in l.line_comment {
+            if (!handled && at_mark(line, i, mark)) {
+                out = out + plain + ui.dim(line.substring(i, line.len()));
+                plain = "";
+                i = line.len();
+                handled = true;
+            }
+        }
+        if (handled) {
+            continue;
+        }
+        if (at_mark(line, i, l.block_open)) {
+            out = out + plain;
+            plain = "";
+            st.in_block = true;
+            // Sin avanzar: el `/*` es parte del comentario, y dejándolo para la rama de
+            // arriba sale con el resto en UN tramo en vez de en dos del mismo color. No hay
+            // bucle posible — esa rama siempre consume hasta el cierre o hasta el final.
+            continue;
+        }
+        if (l.quotes.contains(c)) {
+            // La comilla de apertura es parte de la cadena, y se pinta con ella en UN solo
+            // tramo: dos tramos seguidos serían el mismo color con el doble de escapes.
+            let ends = string_end(l, line, i + 1, c);
+            out = out + plain + ui.green(line.substring(i, ends.0));
+            plain = "";
+            if (!ends.1) {
+                st.quote = c;
+            }
+            i = ends.0;
+            continue;
+        }
+        // Un número: solo cuando empieza de verdad, no en medio de `utf8` ni de `x2`.
+        if (is_digit(c) && (i == 0 || !is_word(line.substring(i - 1, i)))) {
+            var j = i;
+            while (j < line.len()
+                && (is_digit(line.substring(j, j + 1))
+                    || line.substring(j, j + 1) == "."
+                    || line.substring(j, j + 1) == "x")) {
+                j = j + 1;
+            }
+            out = out + plain + ui.yellow(line.substring(i, j));
+            plain = "";
+            i = j;
+            continue;
+        }
+        if (starts_word(c)) {
+            var j = i;
+            while (j < line.len() && is_word(line.substring(j, j + 1))) {
+                j = j + 1;
+            }
+            let word = line.substring(i, j);
+            if (l.keywords.contains(word)) {
+                out = out + plain + ui.magenta(word);
+                plain = "";
+            } else {
+                plain = plain + word;
+            }
+            i = j;
+            continue;
+        }
+        plain = plain + c;
+        i = i + 1;
+    }
+    out + plain
+}

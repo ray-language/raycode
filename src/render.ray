@@ -7,6 +7,7 @@
 import std/markdown;
 from std/markdown import Block, Inline;
 import src/ui;
+import src/syntax;
 
 const MIN_WIDTH: int = 24;
 
@@ -30,6 +31,29 @@ pub fn visible_len(s: string) -> int {
         i = i + 1;
     }
     count
+}
+
+/// `s` without its ANSI escapes: what the reader actually sees, as text. The complement of
+/// `visible_len`, and what anything that has to compare painted output against the original
+/// needs — colour is allowed to change how a line looks, never what it says.
+pub fn plain(s: string) -> string {
+    var out = "";
+    var i = 0;
+    var skipping = false;
+    while (i < s.len()) {
+        let c = s.substring(i, i + 1);
+        if (skipping) {
+            if (c == "m") {
+                skipping = false;
+            }
+        } else if (char_code(c[0]) == 27) {
+            skipping = true;
+        } else {
+            out = out + c;
+        }
+        i = i + 1;
+    }
+    out
 }
 
 // Reparte por palabras hasta `width` columnas; las líneas siguientes llevan `indent`.
@@ -168,15 +192,7 @@ fn block_lines(b: Block, width: int) -> [string] {
             wrap(painted, width, "")
         },
         Block.Paragraph(content) => wrap(inlines(content), width, ""),
-        Block.Code(language, text) => {
-            var lines: [string] = [];
-            lines.push(ui.dim("┌ ${language}"));
-            for line in text.split("\n") {
-                lines.push(ui.dim("│ ") + line);
-            }
-            lines.push(ui.dim("└"));
-            lines
-        },
+        Block.Code(language, text) => code_lines(language, text, width),
         Block.Quote(inner) => {
             var lines: [string] = [];
             for line in blocks_lines(inner, width - 2, true) {
@@ -212,6 +228,57 @@ fn block_lines(b: Block, width: int) -> [string] {
             lines
         },
     }
+}
+
+// Un bloque de código, enmarcado. El marco se cierra a la anchura del contenido —no a la
+// de la ventana, que dejaría un rectángulo enorme alrededor de tres palabras— y lleva el
+// lenguaje en la esquina cuando la cerca lo declaró.
+//
+// Los saltos de línea del final se quitan antes de partir: una cerca casi siempre termina
+// en salto, y ése sale como una línea vacía del marco — un `│` suelto justo antes de
+// cerrar, que se lee como si el bloque tuviera algo más que no se ve.
+fn code_lines(language: string, text: string, width: int) -> [string] {
+    var body = text;
+    while (body.ends_with("\n") || body.ends_with("\r")) {
+        body = body.substring(0, body.len() - 1);
+    }
+    // Se mide ANTES de pintar y se pinta después: la anchura es la del código, y las
+    // escapes de color no ocupan columnas (`visible_len` las salta, pero medir lo crudo es
+    // más barato y no depende de que las salte bien).
+    var widest = 0;
+    var raw: [string] = [];
+    for line in body.split("\n") {
+        raw.push(line);
+        let size = visible_len(line);
+        if (size > widest) {
+            widest = size;
+        }
+    }
+    let content = syntax.paint_lines(language, raw);
+    let label = language.trim();
+    // El ancho del marco es el del contenido, porque es con el contenido con lo que tiene
+    // que cuadrar: una línea vale "│ " más el texto, así que el borde mide dos columnas más
+    // que la línea más larga. Ni baja de lo que ocupa su propia etiqueta, ni pasa de la
+    // ventana.
+    var inner = if (widest > label.len() + 1) { widest } else { label.len() + 1 };
+    if (inner > width - 2) {
+        inner = width - 2;
+    }
+    if (inner < 1) {
+        inner = 1;
+    }
+    var lines: [string] = [];
+    if (label == "") {
+        lines.push(ui.dim("┌" + "─".repeat(inner + 1)));
+    } else {
+        let rest = inner - label.len() - 1;
+        lines.push(ui.dim("┌ " + label + if (rest > 0) { " " + "─".repeat(rest) } else { "" }));
+    }
+    for line in content {
+        lines.push(ui.dim("│ ") + line);
+    }
+    lines.push(ui.dim("└" + "─".repeat(inner + 1)));
+    lines
 }
 
 // Una lista: la viñeta (o el número) sangra la primera línea y el resto se alinea bajo

@@ -229,6 +229,14 @@ pub fn usage_line(u: Usage) -> string {
     // `≈` avisa de que las cifras las contó el harness, no el proveedor.
     let mark = if (usage.is_estimate(u)) { "≈" } else { "" };
     dim(
-        "↑ ${mark}${fmt_count(u.input_tokens)} in  ↓ ${mark}${fmt_count(u.output_tokens)} out${cached}" + " · ${u.requests} req · ${fmt_millis(u.latency_ms)} · ${fmt_float(speed, 1)} tok/s"
+        "↑ "
+            + to_string(mark)
+            + to_string(fmt_count(u.input_tokens))
+            + " in  ↓ "
+            + to_string(mark)
+            + to_string(fmt_count(u.output_tokens))
+            + " out"
+            + to_string(cached)
+            + " · ${u.requests} req · ${fmt_millis(u.latency_ms)} · ${fmt_float(speed, 1)} tok/s"
     )
 }

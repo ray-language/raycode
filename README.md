@@ -125,11 +125,22 @@ se suman las herramientas de cualquier [servidor MCP](#servidores-mcp).
 - **Markdown en la respuesta.** El AST viene de `std/markdown` y aquí se pinta:
   negritas, cursivas, `código`, títulos, listas (anidadas y ordenadas), citas,
   reglas, enlaces, imágenes, **tablas GFM con su alineación** y bloques cercados
-  (verbatim, enmarcados), repartido por palabras al ancho de la ventana.
+  (enmarcados a la anchura de su propio contenido, con el lenguaje en la esquina **y
+  resaltado por sintaxis**), repartido por palabras al ancho de la ventana.
   Además fija el ritmo vertical: una línea en blanco alrededor de lo que abre
   sección —títulos, reglas, bloques de código, tablas—, nunca dos seguidas y
   ninguna en los bordes; y cada bloque del turno (herramienta, respuesta, uso)
   queda separado del siguiente. Sin color, las marcas simplemente desaparecen.
+- **Código con color.** `src/syntax.ray` pinta lo que va dentro de una cerca: comentario,
+  cadena, número y palabra clave, con un perfil por familia (ray/rust, js/ts/java/c, python,
+  go, sh, json, toml/yaml, sql) y uno genérico para lo demás. Un `diff` se pinta por lados,
+  que es lo que se mira en un parche. Es pequeño a propósito —no es un analizador, no sabe
+  de ámbitos— porque empotrar el motor de ray-sublime, con sus 484 gramáticas
+  `.sublime-syntax`, para pintar diez líneas de shell sería pagar un motor por un adorno. El
+  estado cruza los saltos de línea, así que un comentario de bloque o una cadena sin cerrar
+  siguen pintados en la línea siguiente. Y lo que nunca hace es tocar el texto: `text`,
+  `output`, `markdown` y las cercas sin etiqueta salen tal cual, y de las demás se pinta lo
+  que se ve, no lo que dice — un bloque de código sigue siendo copiable.
 - **Actividad a la vista.** Mientras el modelo piensa y mientras una herramienta
   trabaja se dibuja un indicador con el tiempo transcurrido (`⠙ thinking · step 2
   1.4s`). Lo anima una fibra aparte: funciona porque la petición HTTP y el drenado

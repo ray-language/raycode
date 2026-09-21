@@ -613,12 +613,20 @@ pub fn call_summary(name: string, arguments: string) -> [string] {
     }
 }
 
-// La llamada en pantalla: la cabecera con su viñeta y el resto en gris, como el resultado.
-fn show_call(name: string, arguments: string, raw: bool) {
+// La llamada en pantalla.
+//
+// Por defecto, UNA LÍNEA: el nombre y sus argumentos cortos. Lo que se quiere saber de un
+// paso intermedio es qué se está haciendo, y para eso «read_file src/mcp.ray» sobra; el
+// contenido de un parche o de un archivo entero, entre medias, entierra la conversación en
+// la que va dentro. Con `/verbose` baja todo, como código.
+fn show_call(name: string, arguments: string, raw: bool, verbose: bool) {
     let lines = call_summary(name, arguments);
     let head = lines[0];
     let cut = name.len();
     say(ui.yellow("⚙ ") + ui.bold(name) + ui.dim(head.substring(cut, head.len())), raw);
+    if (!verbose) {
+        return;
+    }
     var i = 1;
     while (i < lines.len()) {
         say(ui.dim(lines[i]), raw);
@@ -626,9 +634,37 @@ fn show_call(name: string, arguments: string, raw: bool) {
     }
 }
 
-// El resultado, sangrado y recortado: el modelo lo ve entero, el usuario un resumen.
-fn show_result(text: string, raw: bool) {
-    say(ui.dim(ui.indent(ui.clip(text.trim(), 400), "  │ ")), raw);
+// Y el resultado, en una línea que dice de qué tamaño fue. El modelo lo ve entero; quien
+// mira la pantalla quiere saber que salió bien y seguir leyendo.
+fn show_result(text: string, raw: bool, verbose: bool) {
+    if (verbose) {
+        say(ui.dim(ui.indent(ui.clip(text.trim(), 400), "  │ ")), raw);
+        return;
+    }
+    say(ui.dim("  ⎿ " + result_summary(text)), raw);
+}
+
+/// A tool's output in one line: what went wrong when it did, and otherwise its size and its
+/// first line, which between them say whether it answered what was asked.
+pub fn result_summary(text: string) -> string {
+    let body = text.trim();
+    if (body == "") {
+        return "(nothing)";
+    }
+    if (body.starts_with("error:") || body.starts_with("error ")) {
+        return ui.clip(first_line(body), ui.width() - 6);
+    }
+    let lines = body.split("\n");
+    if (lines.len() == 1) {
+        return ui.clip(body, ui.width() - 6);
+    }
+    let size = plural(lines.len(), "line");
+    ui.clip("${size} · " + first_line(body), ui.width() - 6)
+}
+
+fn first_line(text: string) -> string {
+    let lines = text.split("\n");
+    if (lines.len() == 0) { text } else { lines[0].trim() }
 }
 
 // La respuesta del modelo, con su Markdown pintado y sangrada bajo la viñeta.
@@ -712,14 +748,13 @@ fn run_turn(s: Session, width: int, raw: bool) -> Result<Usage, string> {
                 var i = 0;
                 while (i < calls.len()) {
                     let call = calls[i];
-                    show_call(call.name, call.arguments, raw);
+                    show_call(call.name, call.arguments, raw, s.config.verbose);
                     // Nada que cambie el proyecto corre sin el sí que pida el nivel. Un no
                     // no rompe la conversación: se contesta a la llamada y el turno sigue,
                     // porque un `tool_use` sin su resultado invalida el historial.
                     let refusal = consent_for(s, call, raw);
                     if (refusal != "") {
                         say(ui.yellow("■ ") + ui.dim(refusal), raw);
-                        say("", raw);
                         s.history.push(message.tool_result(call.id, refusal));
                     } else {
                         match (call_tool(s, call, raw)) {
@@ -730,8 +765,7 @@ fn run_turn(s: Session, width: int, raw: bool) -> Result<Usage, string> {
                                 return Result.Ok(turn);
                             },
                             Option.Some(result) => {
-                                show_result(result, raw);
-                                say("", raw);
+                                show_result(result, raw, s.config.verbose);
                                 s.history.push(message.tool_result(call.id, result));
                             },
                         }

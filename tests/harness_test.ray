@@ -13,6 +13,7 @@ import src/client;
 import std/time;
 import std/fs;
 import src/render;
+import src/syntax;
 import src/mcp;
 import std/json;
 import std/process;
@@ -436,9 +437,11 @@ fn markdown_marks_are_rendered_not_shown() {
 
 @test
 fn markdown_leaves_fenced_code_alone() {
-    // Dentro de una cerca no se interpreta nada: el código se lee y se copia tal cual.
+    // Dentro de una cerca no se interpreta nada: el código se lee y se copia tal cual. El
+    // resaltado pinta el texto, así que la comparación va sobre lo que se ve, sin escapes —
+    // si el color cambiara el TEXTO, un bloque de código dejaría de ser copiable.
     let fenced = render.markdown_text("```raylang\nlet x = a ** b;\n```", 60);
-    assert(fenced.contains("let x = a ** b;"));
+    assert(render.plain(fenced).contains("let x = a ** b;"));
     assert(fenced.contains("┌ raylang"));
     // Un delimitador que nunca cierra se queda como texto.
     assert(render.markdown_text("sin **par aquí", 60).contains("**par"));
@@ -1111,6 +1114,96 @@ fn an_explained_error_still_carries_what_fixes_the_request() {
     assert(!explained.contains(`{"error"`));
     assert(client.adapt_to(c, explained) != "");
     assert_eq(c.max_tokens_field, config.MAX_COMPLETION_TOKENS);
+}
+
+@test
+fn painting_code_never_changes_it() {
+    // La invariante que sostiene todo lo demás: el color no toca el texto. Si lo tocara, un
+    // bloque de código en una respuesta dejaría de ser copiable, que es para lo que está.
+    let lines = [
+        `let s = "hola \\"mundo\\"";   // un comentario`,
+        "fn main() { return 42; }",
+        "  sin nada que pintar  "
+    ];
+    let painted = syntax.paint_lines("ray", lines);
+    var i = 0;
+    while (i < lines.len()) {
+        assert_eq(render.plain(painted[i]), lines[i]);
+        i = i + 1;
+    }
+    // Y lo que no es código se devuelve tal cual, sin una sola escape.
+    let plain = syntax.paint_lines("text", ["# esto es salida, no un comentario"]);
+    assert_eq(plain[0], "# esto es salida, no un comentario");
+    // Una cerca sin etiqueta tampoco se pinta: adivinar el lenguaje inventaría significado.
+    assert_eq(syntax.paint_lines("", ["# lo mismo"])[0], "# lo mismo");
+}
+
+@test
+fn a_comment_or_a_string_survives_the_line_break() {
+    // El estado cruza de una línea a la siguiente, que es lo que un bloque de código
+    // necesita y lo que no se puede hacer pintando línea a línea sin llevarlo a mano.
+    let painted = syntax.paint_lines(
+        "ray",
+        ["let x = 1;   /* abre", "sigue", "cierra */ let y = 2;"]
+    );
+    // La línea de en medio está ENTERA dentro del comentario: va apagada y sin palabras clave.
+    assert(painted[1].contains("sigue"));
+    assert(!painted[1].contains("[35m"));
+    // Y en la tercera, lo que viene después del cierre vuelve a pintarse.
+    assert(painted[2].contains("[35mlet"));
+    // Lo mismo para una cadena sin cerrar.
+    let open = syntax.paint_lines("ray", [`let s = "abre`, "sigue dentro", `cierra";`]);
+    assert(!open[1].contains("[35m"));
+}
+
+@test
+fn a_patch_is_coloured_by_side() {
+    let painted = syntax.paint_lines("diff", ["@@ -1,2 +1,3 @@", "-se va", "+llega", " igual"]);
+    assert(painted[0].contains("[36m"));
+    assert(painted[1].contains("[31m"));
+    assert(painted[2].contains("[32m"));
+    assert_eq(painted[3], " igual");
+}
+
+@test
+fn a_code_block_is_framed_to_its_content() {
+    let out = render.markdown_text("```sh\nray fetch\nray build --native\n```\n", 70);
+    let lines = out.split("\n");
+    // Ni una línea de marco vacía: una cerca casi siempre acaba en salto, y ése salía como
+    // un `│` suelto justo antes de cerrar, que se lee como si hubiera algo más.
+    for line in lines {
+        assert(line.trim() != "│");
+    }
+    assert_eq(lines.len(), 4);
+    // El marco cuadra con el contenido: las dos reglas miden lo mismo —el ancho de la línea
+    // más larga más el "│ " que la sangra— y ninguna línea se sale de él. (En columnas
+    // VISIBLES, que no es lo mismo que en caracteres: van pintadas.)
+    let wide = render.visible_len(lines[0]);
+    assert_eq(render.visible_len(lines[lines.len() - 1]), wide);
+    assert_eq(wide, render.visible_len(lines[2]));
+    for line in lines {
+        assert(render.visible_len(line) <= wide);
+    }
+    assert(lines[0].contains("sh"));
+    assert(lines[1].contains("ray fetch"));
+    // Y una cerca sin lenguaje no deja el espacio de la etiqueta que no hay.
+    let bare = render.markdown_text("```\nraycode 0.3.1\n```\n", 70).split("\n");
+    assert_eq(bare.len(), 3);
+    assert(!bare[0].contains("┌ "));
+    assert_eq(render.visible_len(bare[0]), render.visible_len(bare[2]));
+    assert_eq(render.visible_len(bare[0]), render.visible_len(bare[1]));
+}
+
+@test
+fn a_tool_result_reads_as_one_line() {
+    // Una línea corta se enseña tal cual.
+    assert_eq(agent.result_summary("wrote 42 bytes to fib.ray"), "wrote 42 bytes to fib.ray");
+    // Un bloque dice de qué tamaño fue y por dónde empieza, no sus primeros 400 caracteres.
+    let listing = agent.result_summary("a.ray\nb.ray\nc.ray");
+    assert(listing.starts_with("3 lines · a.ray"));
+    // Un fallo se enseña como lo que es, sin contar líneas.
+    assert(agent.result_summary("error: no such file\n  at x").starts_with("error: no such file"));
+    assert_eq(agent.result_summary("   "), "(nothing)");
 }
 
 @test
