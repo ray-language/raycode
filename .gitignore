@@ -6,5 +6,9 @@
 # Dependencies fetched by `ray fetch`.
 /.ray-deps/
 
+# Leftovers of a native build (`ray build --native` writes them as it goes).
+/build.log
+/build.status
+
 # macOS
 .DS_Store
