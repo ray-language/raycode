@@ -7,6 +7,9 @@
 pub const VERSION: string = "0.3.1";
 
 import std/uuid;
+import src/permissions;
+import src/modes;
+import src/ui;
 
 /// The wire protocol spoken to the endpoint.
 pub enum Api {
@@ -39,6 +42,17 @@ pub struct Config {
     session_id: string,
     /// Extra request headers (`-H "Name: value"`), for proxies that require their own.
     headers: [string],
+    /// How much happens without a yes: `permissions.ASK`, `EDITS` or `AUTO`.
+    autonomy: string,
+    /// What the turn is for, and whether the tools that change things are on the table:
+    /// `ask`, `plan`, `agent` or `debug`.
+    mode: string,
+    /// The programs the user has lent the agent — by program, not by command line. Grows
+    /// while the session runs, whenever the answer to "run this?" is "always".
+    allowed_programs: [string],
+    /// Tools lent by name, for everything that is not a shell command (an MCP tool that
+    /// changes things, say). Same growth, same lifetime: the session.
+    allowed_tools: [string],
 }
 
 /// The protocol name, for the banner.
@@ -55,6 +69,18 @@ fn env_or(name: string, fallback: string) -> string {
         Option.Some(v) => if (v.trim() == "") { fallback } else { v },
         Option.None => fallback,
     }
+}
+
+// Los programas prestados de antemano: `RAYCODE_ALLOW="make,git"`.
+fn allowed_from_env() -> [string] {
+    var out: [string] = [];
+    for raw in env_or("RAYCODE_ALLOW", "").split(",") {
+        let name = raw.trim();
+        if (name != "") {
+            out.push(name);
+        }
+    }
+    out
 }
 
 const DEFAULT_SYSTEM: string = "You are raycode, a concise coding assistant running in a terminal harness. Use the available tools to inspect and edit the workspace before answering. Keep answers short and concrete.";
@@ -99,7 +125,19 @@ fn preset(profile: string) -> Result<Config, string> {
         version: false,
         mcp_instructions: "",
         session_id: uuid.uuid_v4(),
-        headers: []
+        headers: [],
+        autonomy: env_or("RAYCODE_AUTONOMY", if (ui.interactive()) {
+            // Con un terminal delante se puede preguntar, así que se pregunta. Sin él no hay a
+            // quién, y negarlo todo dejaría inservible el modo de un solo turno: las escrituras
+            // se aplican —van al espacio de trabajo y a ningún otro sitio, que es lo que
+            // garantiza `src/paths`— y los mandatos siguen necesitando que se digan.
+            permissions.ASK
+        } else {
+            permissions.EDITS
+        }),
+        allowed_programs: allowed_from_env(),
+        allowed_tools: [],
+        mode: env_or("RAYCODE_MODE", modes.AGENT),
     };
     if (profile == "llama" || profile == "local") {
         base.api = Api.OpenAI;
@@ -148,6 +186,9 @@ pub fn load(argv: [string]) -> Result<Config, string> {
         i = i + 1;
     }
     var cfg = preset(profile)?;
+    // Una autonomía puesta a mano gana sobre lo que implique cualquier otra bandera, venga
+    // antes o después de ella.
+    var autonomy_set = false;
     var positional: [string] = [];
     i = 0;
     while (i < argv.len()) {
@@ -187,7 +228,36 @@ pub fn load(argv: [string]) -> Result<Config, string> {
             i = i + 1;
         } else if (a == "--allow-exec") {
             cfg.allow_exec = true;
+            // La bandera dice literalmente «permite ejecutar», y lo que hacía hasta ahora
+            // era eso: ofrecer la herramienta y correr lo que pidiera el modelo. Se
+            // conserva — quien quiera que además pregunte pone `--autonomy ask` después.
+            if (!autonomy_set) {
+                cfg.autonomy = permissions.AUTO;
+            }
             i = i + 1;
+        } else if (a == "--autonomy") {
+            let v = value_of(argv, i, a)?;
+            if (!permissions.known(v)) {
+                return Result.Err("unknown autonomy '${v}' (use: ${permissions.ids().join(", ")})");
+            }
+            cfg.autonomy = v;
+            autonomy_set = true;
+            i = i + 2;
+        } else if (a == "--mode") {
+            let v = value_of(argv, i, a)?;
+            if (!modes.known(v)) {
+                return Result.Err("unknown mode '${v}' (use: ${modes.ids().join(", ")})");
+            }
+            cfg.mode = v;
+            i = i + 2;
+        } else if (a == "--allow") {
+            let v = value_of(argv, i, a)?;
+            for name in v.split(",") {
+                if (name.trim() != "") {
+                    cfg.allowed_programs.push(name.trim());
+                }
+            }
+            i = i + 2;
         } else if (a == "--mcp-config") {
             cfg.mcp_config = value_of(argv, i, a)?;
             i = i + 2;
@@ -257,17 +327,26 @@ pub fn new_session(c: Config) {
     c.session_id = uuid.uuid_v4();
 }
 
-/// The system prompt as sent to the model: the user's, followed by whatever the MCP
-/// servers asked for in their `initialize` reply. `/system` shows and edits only the first
-/// part; the second follows the servers.
+/// The system prompt as sent to the model: the user's, then what the autonomy level is
+/// worth telling it, then whatever the MCP servers asked for in their `initialize` reply.
+/// `/system` shows and edits only the first part; the rest follows the session.
 pub fn system_prompt(c: Config) -> string {
-    if (c.mcp_instructions.trim() == "") {
-        c.system
-    } else if (c.system.trim() == "") {
-        c.mcp_instructions
-    } else {
-        c.system + "\n\n" + c.mcp_instructions
+    var parts: [string] = [];
+    if (c.system.trim() != "") {
+        parts.push(c.system);
     }
+    let job = modes.prompt_for(c.mode);
+    if (job != "") {
+        parts.push(job);
+    }
+    let stance = permissions.prompt_for(c.autonomy);
+    if (stance != "") {
+        parts.push(stance);
+    }
+    if (c.mcp_instructions.trim() != "") {
+        parts.push(c.mcp_instructions);
+    }
+    parts.join("\n\n")
 }
 
 /// The endpoint URL for a chat completion, derived from the base URL and the protocol.

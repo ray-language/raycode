@@ -1,0 +1,106 @@
+// Cómo se espera que se porte el agente: para qué es este turno, y qué tiene sobre la mesa.
+//
+// El mismo modelo con las mismas herramientas contesta una pregunta, esboza un plan o
+// reescribe un módulo, y cuál de las tres hace debería ser una elección y no algo que haya
+// que conseguir redactando con cuidado. Un modo son dos cosas y ninguna más: un párrafo al
+// final del prompt diciendo qué se quiere, y si las herramientas que CAMBIAN cosas están
+// sobre la mesa siquiera.
+//
+// La segunda mitad es la que cuenta. Pedirle por favor a un modelo que no toque nada es una
+// petición; no darle `write_file` es un hecho.
+
+pub struct Mode {
+    id: string,
+    label: string,
+    /// One line, for the menu.
+    note: string,
+    /// Whether it may write files, run commands, or use an MCP tool that has not said it
+    /// only reads.
+    writes: bool,
+}
+
+pub const AGENT: string = "agent";
+
+pub fn all() -> [Mode] {
+    [
+        Mode {
+            id: "ask",
+            label: "Ask",
+            note: "Answers questions. Reads, never changes.",
+            writes: false
+        },
+        Mode {
+            id: "plan",
+            label: "Plan",
+            note: "Works out what it would do, without doing it.",
+            writes: false
+        },
+        Mode {
+            id: AGENT,
+            label: "Agent",
+            note: "Reads, writes and runs — with your say-so.",
+            writes: true
+        },
+        Mode {
+            id: "debug",
+            label: "Debug",
+            note: "Finds the cause before proposing a cure.",
+            writes: true
+        }
+    ]
+}
+
+pub fn known(id: string) -> bool {
+    for m in all() {
+        if (m.id == id) {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn find(id: string) -> Mode {
+    for m in all() {
+        if (m.id == id) {
+            return m;
+        }
+    }
+    Mode {
+        id: AGENT,
+        label: "Agent",
+        note: "Reads, writes and runs — with your say-so.",
+        writes: true
+    }
+}
+
+/// The ids, for an error message that has to list them.
+pub fn ids() -> [string] {
+    var out: [string] = [];
+    for m in all() {
+        out.push(m.id);
+    }
+    out
+}
+
+/// What the mode adds to the prompt. It goes after the user's own words, so it is the
+/// freshest thing said before the conversation starts.
+pub fn prompt_for(id: string) -> string {
+    if (id == "ask") {
+        return "You are answering a question about this project. Read whatever you need, but "
+            + "change nothing: no writes, no commands. If a change is what is wanted, say "
+            + "what you would change and where, and let them ask for it.";
+    }
+    if (id == "plan") {
+        return "You are working out a plan, not carrying it out. Read what you need to be "
+            + "sure of it, then answer with an ordered list of the steps you would take, "
+            + "each naming the file it touches and what would change in it. Change nothing "
+            + "yourself; the plan is the answer.";
+    }
+    if (id == "debug") {
+        return "You are finding the cause of a problem. Reproduce it if you can — running the "
+            + "tests or the build is usually the fastest way — and read the code around it "
+            + "before you decide. Say what is actually happening before you propose a cure, "
+            + "and prefer the smallest change that fixes the cause rather than the symptom.";
+    }
+    ""
+}

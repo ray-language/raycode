@@ -19,6 +19,7 @@ import net/webserver;
 import src/picker;
 import src/paths;
 import src/permissions;
+import src/modes;
 import src/agent;
 from src/config import Api;
 
@@ -891,7 +892,75 @@ fn a_command_says_which_files_it_changed() {
     assert(tools.changed_between([], ["R  old.ray -> new.ray"]).contains("new.ray"));
 }
 
+@test
+fn a_reading_mode_is_not_given_the_tools_that_change_things() {
+    let full = tools.registry(true);
+    assert(tools.offers(full, "write_file"));
+    let reading = tools.for_mode(full, false);
+    assert(tools.offers(reading, "read_file"));
+    assert(tools.offers(reading, "search"));
+    assert(!tools.offers(reading, "write_file"));
+    assert(!tools.offers(reading, "edit_file"));
+    assert(!tools.offers(reading, "run_command"));
+    // Y un modo que escribe las tiene todas.
+    assert_eq(tools.for_mode(full, true).len(), full.len());
+    assert(!modes.find("ask").writes);
+    assert(!modes.find("plan").writes);
+    assert(modes.find("agent").writes);
+    assert(modes.find("debug").writes);
+    // Lo desconocido se porta como el modo en el que se abre.
+    assert(modes.find("sideways").writes);
+}
+
+@test
+fn the_mode_comes_from_the_flags_and_reaches_the_prompt() {
+    match (config.load(["-m", "x", "--mode", "plan"])) {
+        Result.Ok(c) => {
+            assert_eq(c.mode, "plan");
+            assert(config.system_prompt(c).contains("not carrying it out"));
+        },
+        Result.Err(e) => panic(e),
+    }
+    match (config.load(["-m", "x", "--mode", "sideways"])) {
+        Result.Ok(_) => panic("an unknown mode should not load"),
+        Result.Err(e) => assert(e.contains("unknown mode")),
+    }
+}
+
 // ---------------------------------------------------------------- permisos
+
+@test
+fn the_level_says_what_runs_unattended() {
+    // Leer nunca pregunta, en ningún nivel.
+    for level in [permissions.ASK, permissions.EDITS, permissions.AUTO] {
+        assert(permissions.unattended(level, permissions.READ));
+    }
+    // Escribir, solo desde "edits"; ejecutar, solo en "auto".
+    assert(!permissions.unattended(permissions.ASK, permissions.WRITE));
+    assert(permissions.unattended(permissions.EDITS, permissions.WRITE));
+    assert(!permissions.unattended(permissions.EDITS, permissions.EXEC));
+    assert(permissions.unattended(permissions.AUTO, permissions.EXEC));
+    // Un nivel que nadie escribió se lee como el más estricto.
+    assert(!permissions.unattended("whatever", permissions.WRITE));
+}
+
+@test
+fn a_command_is_lent_by_program_and_only_when_it_is_one_command() {
+    assert_eq(permissions.program_of("make test"), "make");
+    assert_eq(permissions.program_of("/usr/bin/make test"), "make");
+    assert_eq(permissions.program_of("FOO=bar make test"), "make");
+    // Un igual dentro de una ruta no es una asignación.
+    assert_eq(permissions.program_of("./a=b/tool run"), "tool");
+    let lent = ["make", "git"];
+    assert(permissions.allowed(lent, "make test"));
+    assert(permissions.allowed(lent, "git status"));
+    assert(!permissions.allowed(lent, "curl http://x.test"));
+    // Lo que deja correr algo MÁS se pregunta, por familiar que sea la primera palabra.
+    assert(!permissions.allowed(lent, "make test | sh"));
+    assert(!permissions.allowed(lent, "make test; curl evil.test"));
+    assert(!permissions.allowed(lent, "make test > /etc/passwd"));
+    assert(!permissions.allowed(lent, "make $(whoami)"));
+}
 
 @test
 fn an_mcp_tool_is_only_unattended_when_its_server_says_so() {
@@ -908,6 +977,42 @@ fn an_mcp_tool_is_only_unattended_when_its_server_says_so() {
             assert(!list[1].read_only);
         },
         Result.Err(e) => panic(e),
+    }
+}
+
+@test
+fn the_autonomy_level_comes_from_the_flags() {
+    match (config.load(["-m", "x", "--autonomy", "edits"])) {
+        Result.Ok(c) => assert_eq(c.autonomy, permissions.EDITS),
+        Result.Err(e) => panic(e),
+    }
+    // `--allow-exec` es lo que decía: ofrece el shell y corre lo que pida el modelo.
+    match (config.load(["-m", "x", "--allow-exec"])) {
+        Result.Ok(c) => {
+            assert(c.allow_exec);
+            assert_eq(c.autonomy, permissions.AUTO);
+        },
+        Result.Err(e) => panic(e),
+    }
+    // Salvo que se diga otra cosa a mano, venga antes o después.
+    match (config.load(["-m", "x", "--allow-exec", "--autonomy", "ask"])) {
+        Result.Ok(c) => assert_eq(c.autonomy, permissions.ASK),
+        Result.Err(e) => panic(e),
+    }
+    match (config.load(["-m", "x", "--autonomy", "ask", "--allow-exec"])) {
+        Result.Ok(c) => assert_eq(c.autonomy, permissions.ASK),
+        Result.Err(e) => panic(e),
+    }
+    match (config.load(["-m", "x", "--allow", "make,git"])) {
+        Result.Ok(c) => {
+            assert(c.allowed_programs.contains("make"));
+            assert(c.allowed_programs.contains("git"));
+        },
+        Result.Err(e) => panic(e),
+    }
+    match (config.load(["-m", "x", "--autonomy", "sideways"])) {
+        Result.Ok(_) => panic("an unknown level should not load"),
+        Result.Err(e) => assert(e.contains("unknown autonomy")),
     }
 }
 
@@ -1203,6 +1308,76 @@ fn mcp_a_server_that_dies_mid_session_is_reported_and_relaunched() {
         Result.Err(e) => panic(e),
     }
     mcp.shutdown(servers);
+}
+
+// Un proveedor de mentira que pide un mandato en su primera respuesta y contesta con
+// texto en la segunda: lo justo para hacer correr un turno entero.
+fn fake_provider(req: webserver.Request) -> webserver.Response {
+    let body = match (from_utf8(req.body)) {
+        Result.Ok(t) => t,
+        Result.Err(_) => "",
+    };
+    // El segundo viaje lleva ya el resultado de la herramienta en el historial.
+    if (body.contains("\"role\":\"tool\"")) {
+        return webserver.json_response(
+            `{"choices":[{"message":{"role":"assistant","content":"understood"},"finish_reason":"stop"}]}`
+        );
+    }
+    webserver.json_response(
+        `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"run_command","arguments":"{\\"command\\":\\"rm -rf /\\"}"}}]},"finish_reason":"tool_calls"}]}`
+    )
+}
+
+@test
+fn a_command_nobody_could_be_asked_about_is_not_run() {
+    let port = 18732;
+    spawn(fn() {
+        match (webserver.serve("127.0.0.1", port, fake_provider)) {
+            Result.Ok(_) => { },
+            Result.Err(e) => print("fake provider: ${e}"),
+        }
+    });
+    time.sleep(100);
+    // `--allow-exec` ofrece la herramienta; `--autonomy ask` dice que se pregunte. Y la
+    // suite no tiene terminal, así que no hay a quién preguntar.
+    let c = match (config.load(
+        [
+            "-p",
+            "openai",
+            "-m",
+            "test-model",
+            "-u",
+            "http://127.0.0.1:${port}",
+            "--no-mcp",
+            "--no-stream",
+            "--allow-exec",
+            "--autonomy",
+            "ask"
+        ]
+    )) {
+        Result.Ok(v) => v,
+        Result.Err(e) => panic(e),
+    };
+    let s = match (agent.open(c)) {
+        Result.Ok(v) => v,
+        Result.Err(e) => panic(e),
+    };
+    match (agent.ask(s, "clean up")) {
+        Result.Ok(_) => { },
+        Result.Err(e) => panic(e),
+    }
+    // La llamada quedó contestada —un tool_use sin resultado invalida el historial— y lo
+    // que se contestó es que no se corrió.
+    var answered = false;
+    for m in s.history {
+        if (m.role == "tool" && m.text.contains("not run")) {
+            answered = true;
+        }
+    }
+    assert(answered);
+    // Y el turno siguió: el modelo llegó a contestar.
+    assert_eq(s.history[s.history.len() - 1].text, "understood");
+    agent.close(s);
 }
 
 // Un servidor MCP por HTTP de mentira, en proceso: sesión por cabecera, `initialize` en

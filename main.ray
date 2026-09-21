@@ -20,6 +20,9 @@ import src/ui;
 import src/mcp;
 import src/message;
 import src/picker;
+import src/paths;
+import src/permissions;
+import src/modes;
 
 // La cabecera: qué modelo, contra qué endpoint, con qué herramientas. Lo que el endpoint
 // declare sobre el modelo cargado se muestra junto a lo configurado.
@@ -47,11 +50,16 @@ fn banner(s: agent.Session) {
     print(
         ui.dim("sampling ") + "max_tokens ${c.max_tokens} · temperature ${ui.fmt_float(c.temperature, 2)} · max_steps ${c.max_steps} · ${flow}"
     );
-    if (ui.workspace() != ".") {
-        print(ui.dim("workspace ") + ui.workspace());
+    print(ui.dim("workspace ") + paths.root());
+    let mode = modes.find(c.mode);
+    print(ui.dim("mode     ") + mode.label + ui.dim(" · ${mode.note}"));
+    let level = permissions.find(c.autonomy);
+    print(ui.dim("autonomy ") + level.label + ui.dim(" · ${level.note}"));
+    if (c.allowed_programs.len() > 0) {
+        print(ui.dim("allowed  ") + c.allowed_programs.join(", "));
     }
     var names: [string] = [];
-    for t in s.tools {
+    for t in agent.offered(s) {
         if (t.source == "") {
             names.push(t.name);
         }
@@ -176,6 +184,9 @@ fn commands() -> [string] {
         "/mcp",
         "/resource",
         "/system",
+        "/mode",
+        "/autonomy",
+        "/allow",
         "/reset",
         "/verbose",
         "/exit",
@@ -197,6 +208,9 @@ fn help() {
     print("  /resource <uri>    put an MCP resource into the conversation");
     print("  /system <text>     replace the system prompt (empty: show it)");
     print("  /reset             forget the transcript, keep the session totals");
+    print("  /mode [<name>]     what the turn is for: ask, plan, agent, debug");
+    print("  /autonomy [<lvl>]  how much runs without a yes: ask, edits, auto");
+    print("  /allow [<prog>]    the programs lent to the agent; with a name, lend one more");
     print("  /verbose           toggle request/response tracing on stderr");
     print("  /exit              leave (same as Ctrl-D)");
     print(ui.dim("  esc stops the turn in progress (the model or the tool it is running)"));
@@ -357,6 +371,65 @@ fn show_tools(s: agent.Session) {
     }
 }
 
+// El modo, en caliente. Cambiarlo no borra la conversación: preguntar algo en `ask` y
+// luego pasar a `agent` para que lo arregle es la forma normal de usar esto.
+fn set_mode(s: agent.Session, rest: string) {
+    if (rest == "") {
+        for m in modes.all() {
+            let mark = if (m.id == s.config.mode) { ui.green("● ") } else { ui.dim("○ ") };
+            print("  " + mark + ui.bold(m.id) + ui.dim(" · ${m.note}"));
+        }
+        return;
+    }
+    if (!modes.known(rest)) {
+        print(ui.red("! ") + "unknown mode '${rest}' (use: ${modes.ids().join(", ")})");
+        return;
+    }
+    s.config.mode = rest;
+    let m = modes.find(rest);
+    let what = if (m.writes) { "" } else { ui.dim(" · only the tools that read are on the table") };
+    print(ui.dim("mode is now ") + ui.bold(m.label) + what);
+}
+
+// El nivel de autonomía, en caliente. Sin argumento, dice dónde está y qué significan los
+// tres. Subirlo a mitad de conversación es legítimo: se empieza mirando y se acaba
+// dejándole hacer, que es como se gana la confianza.
+fn set_autonomy(s: agent.Session, rest: string) {
+    if (rest == "") {
+        for l in permissions.all() {
+            let mark = if (l.id == s.config.autonomy) { ui.green("● ") } else { ui.dim("○ ") };
+            print("  " + mark + ui.bold(l.id) + ui.dim(" · ${l.note}"));
+        }
+        return;
+    }
+    if (!permissions.known(rest)) {
+        print(ui.red("! ") + "unknown level '${rest}' (use: ${permissions.ids().join(", ")})");
+        return;
+    }
+    s.config.autonomy = rest;
+    print(ui.dim("autonomy is now ") + ui.bold(permissions.find(rest).label));
+}
+
+// Los programas prestados. Es el programa y no la línea: `make test` y `make ci` son una
+// sola decisión para cualquiera que no sea un ordenador.
+fn lend_program(s: agent.Session, rest: string) {
+    if (rest == "") {
+        if (s.config.allowed_programs.len() == 0) {
+            print(ui.dim("no program is allowed; the agent asks before every command"));
+        } else {
+            print(ui.dim("allowed: ") + s.config.allowed_programs.join(", "));
+        }
+        return;
+    }
+    for raw in rest.split(" ") {
+        let name = raw.trim();
+        if (name != "" && !s.config.allowed_programs.contains(name)) {
+            s.config.allowed_programs.push(name);
+        }
+    }
+    print(ui.dim("allowed: ") + s.config.allowed_programs.join(", "));
+}
+
 // Un comando de barra. Devuelve false cuando el comando es "salir".
 fn command(s: agent.Session, line: string) -> bool {
     let parts = line.split(" ");
@@ -408,6 +481,12 @@ fn command(s: agent.Session, line: string) -> bool {
             agent.reset(s);
             print(ui.dim("system prompt replaced; transcript cleared"));
         }
+    } else if (name == "/mode") {
+        set_mode(s, rest);
+    } else if (name == "/autonomy") {
+        set_autonomy(s, rest);
+    } else if (name == "/allow") {
+        lend_program(s, rest);
     } else if (name == "/reset") {
         agent.reset(s);
         print(ui.dim("transcript cleared"));
@@ -466,7 +545,7 @@ fn repl(s: agent.Session, editor: lineedit.Editor) -> int {
     0
 }
 
-const USAGE_LINE: string = "usage: raycode [-p llama|openai|anthropic] [-m model] [-u base-url] [-k key] [--allow-exec] [--mcp-config file | --no-mcp] [prompt…]";
+const USAGE_LINE: string = "usage: raycode [-p llama|openai|anthropic] [-m model] [-u base-url] [-k key] [--autonomy ask|edits|auto] [--allow-exec] [--mcp-config file | --no-mcp] [prompt…]";
 
 // La ayuda de línea de órdenes (`--help`): banderas, entorno y órdenes del REPL.
 fn usage() {
@@ -477,7 +556,9 @@ fn usage() {
     print(USAGE_LINE);
     print("");
     print("Without a prompt raycode opens an interactive session; with one it answers");
-    print("once and exits. Tools operate on the current directory (the workspace).");
+    print("once and exits. Tools operate on the current directory (the workspace) and");
+    print("nowhere else: a path that leaves it, one the project's .agentignore excludes,");
+    print("and anything whose name says it holds credentials are refused at every level.");
     print("");
     print(ui.bold("options"));
     print(
@@ -493,7 +574,13 @@ fn usage() {
     print("      --max-steps <n>      tool calls per turn (default 12)");
     print("      --timeout-ms <ms>    request timeout (default 600000)");
     print("      --no-stream          wait for the whole answer instead of streaming it");
-    print("      --allow-exec         enable the run_command tool (shell access, off by default)");
+    print("      --allow-exec         enable the run_command tool (shell access, off by default;");
+    print("                           implies --autonomy auto unless --autonomy is given too)");
+    print("      --autonomy <level>   what happens without a yes: ask (default with a terminal),");
+    print("                           edits (files are written, commands ask), auto (everything)");
+    print("      --allow <prog[,…]>   programs the agent may run without asking (e.g. make,git)");
+    print("      --mode <name>        ask, plan, agent (default) or debug; the reading modes");
+    print("                           are not given the tools that change anything");
     print(
         "      --mcp-config <file>  MCP servers file (default .raycode/mcp.json, then ~/.raycode/mcp.json)"
     );
@@ -506,6 +593,7 @@ fn usage() {
     print("  RAYCODE_PROFILE, RAYCODE_BASE_URL, RAYCODE_MODEL, RAYCODE_API_KEY, RAYCODE_SYSTEM,");
     print("  RAYCODE_MAX_TOKENS, RAYCODE_TEMPERATURE, RAYCODE_MAX_STEPS, RAYCODE_TIMEOUT_MS,");
     print("  RAYCODE_STREAM=off, RAYCODE_MCP_CONFIG, RAYCODE_MCP=off, RAYCODE_WORKSPACE,");
+    print("  RAYCODE_AUTONOMY, RAYCODE_ALLOW, RAYCODE_MODE,");
     print("  RAYCODE_HISTORY, ANTHROPIC_API_KEY, OPENAI_API_KEY, NO_COLOR");
     print("");
     print(ui.bold("examples"));

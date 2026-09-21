@@ -13,6 +13,8 @@ from src/message import Message, ToolCall, Reply;
 import src/message;
 from src/tools import Tool;
 import src/tools;
+import src/permissions;
+import src/modes;
 from src/mcp import Server;
 import src/mcp;
 from src/usage import Usage;
@@ -52,6 +54,13 @@ pub struct Session {
     steps: int,
     /// Keys typed while the turn was running, for the line editor to pick up.
     typeahead: bytes,
+}
+
+/// The catalogue as this session's mode sees it. The full one is kept — a mode is changed
+/// mid-conversation and the tools have to come back — and this is what the model is shown
+/// and what a call is checked against.
+pub fn offered(s: Session) -> [Tool] {
+    tools.for_mode(s.tools, modes.find(s.config.mode).writes)
 }
 
 // Lo que sale de un paso: hay respuesta, falló, o el usuario lo paró.
@@ -222,11 +231,11 @@ fn call_model(s: Session, label: string, width: int, raw: bool, watch: bool) -> 
         // canal y el turno esperaría para siempre. Un fallo tiene que ser un valor.
         let guarded = try_call(fn() -> Result<Reply, string> {
             if (streaming) {
-                client.send_stream(s.config, s.tools, s.history, fn(piece: string) {
+                client.send_stream(s.config, offered(s), s.history, fn(piece: string) {
                     send(signals, Signal.Text(piece));
                 })
             } else {
-                client.send(s.config, s.tools, s.history)
+                client.send(s.config, offered(s), s.history)
             }
         });
         let outcome: Result<Reply, string> = match (guarded) {
@@ -298,7 +307,7 @@ fn call_tool(s: Session, call: ToolCall, watch: bool) -> Option<string> {
     let box: Channel<string> = Channel.new();
     spawn(fn() {
         let guarded = try_call(fn() -> string {
-            tools.execute(s.tools, s.mcp, call.name, call.arguments)
+            tools.execute(offered(s), s.mcp, call.name, call.arguments)
         });
         let result = match (guarded) {
             Result.Ok(text) => text,
@@ -319,6 +328,118 @@ fn call_tool(s: Session, call: ToolCall, watch: bool) -> Option<string> {
         return Option.None;
     }
     recv(box)
+}
+
+// ------------------------------------------------------------- el consentimiento
+
+// El mandato que una llamada va a correr, o "" si no es esa clase de llamada. Se mira el
+// argumento porque el permiso se da sobre el PROGRAMA, no sobre la herramienta: prestar
+// `run_command` entero no es prestar nada, es abrirlo todo.
+fn command_of(call: ToolCall) -> string {
+    if (call.name != "run_command") {
+        return "";
+    }
+    match (json.parse(call.arguments.trim())) {
+        Result.Ok(j) => match (json.get_string(j, "command")) {
+            Option.Some(c) => c,
+            Option.None => "",
+        },
+        Result.Err(_) => "",
+    }
+}
+
+// ¿Puede correr esta llamada? "" = adelante; cualquier otra cosa es lo que se le contesta
+// al modelo en lugar de ejecutarla.
+//
+// El orden importa: primero lo que el nivel deja pasar solo, luego lo que el usuario ya
+// prestó en esta sesión, y solo entonces se le pregunta. Sin terminal no se pregunta: no
+// hay a quién, y una espera en un guion es un cuelgue.
+fn consent_for(s: Session, call: ToolCall, raw: bool) -> string {
+    let risk = tools.risk_of(s.tools, call.name);
+    if (permissions.unattended(s.config.autonomy, risk)) {
+        return "";
+    }
+    if (s.config.allowed_tools.contains(call.name)) {
+        return "";
+    }
+    let command = command_of(call);
+    if (command != "" && permissions.allowed(s.config.allowed_programs, command)) {
+        return "";
+    }
+    if (!raw) {
+        return "not run: raycode is not interactive here, so nobody could be asked. The user "
+            + "can allow it with --autonomy auto, or lend the program with --allow.";
+    }
+    ask_user(s, call, command)
+}
+
+// La pregunta, y lo que se hace con la respuesta. Una tecla, sin Enter: el terminal ya está
+// en modo crudo y la llamada ya se ha enseñado encima.
+fn ask_user(s: Session, call: ToolCall, command: string) -> string {
+    let program = permissions.program_of(command);
+    // «Siempre» presta el programa cuando el mandato es UNO; con una tubería dentro, lo que
+    // se preste no sería lo que se está viendo, así que solo se ofrece el sí de esta vez.
+    let lendable = if (command == "") {
+        call.name
+    } else if (permissions.is_simple(command) && program != "") {
+        program
+    } else {
+        ""
+    };
+    let always = if (lendable == "") { "" } else { " · ${ui.bold("a")} always (${lendable})" };
+    ui.write_inline(
+        ui.crlf(
+            ui.yellow("? ")
+                + "allow this? "
+                + ui.bold("y")
+                + " yes"
+                + always
+                + " · "
+                + ui.bold("n")
+                + " no"
+        )
+    );
+    let key = read_key();
+    if (key == "y" || key == "Y" || key == "\r" || key == "\n") {
+        return "";
+    }
+    if (lendable != "" && (key == "a" || key == "A")) {
+        if (command == "") {
+            s.config.allowed_tools.push(lendable);
+        } else {
+            s.config.allowed_programs.push(lendable);
+        }
+        ui.write_inline(ui.crlf(ui.dim("  ${lendable} is allowed for the rest of this session")));
+        return "";
+    }
+    "the user did not allow this call. Do not try it again; say what you needed it for."
+}
+
+// Una tecla, esperando lo que haga falta. El vigilante de teclas no corre en este momento
+// —vive dentro de cada paso, no entre ellos—, así que aquí no hay quien compita por la
+// entrada. Se sondea en tramos para que un EOF no se quede colgado.
+fn read_key() -> string {
+    var waiting = true;
+    var key = "";
+    while (waiting) {
+        match (io.read_timeout(64, 60000)) {
+            io.ReadResult.Data(chunk) => {
+                // El primer octeto del trozo: una flecha llega como varios y no es
+                // ninguna de las respuestas, así que basta con mirar por dónde empieza.
+                key = if (chunk.len() > 0) {
+                    from_utf8(chunk.sub_bytes(0, 1)).unwrap_or("")
+                } else {
+                    ""
+                };
+                waiting = false;
+            },
+            io.ReadResult.Eof => {
+                waiting = false;
+            },
+            io.ReadResult.TimedOut => { },
+        }
+    }
+    key
 }
 
 // La etiqueta del indicador, con el recordatorio de que se puede parar.
@@ -581,18 +702,28 @@ fn run_turn(s: Session, width: int, raw: bool) -> Result<Usage, string> {
                 while (i < calls.len()) {
                     let call = calls[i];
                     show_call(call.name, call.arguments, raw);
-                    match (call_tool(s, call, raw)) {
-                        Option.None => {
-                            close_pending(s, calls, i);
-                            say(ui.yellow("■ ") + ui.dim("stopped by the user"), raw);
-                            say("", raw);
-                            return Result.Ok(turn);
-                        },
-                        Option.Some(result) => {
-                            show_result(result, raw);
-                            say("", raw);
-                            s.history.push(message.tool_result(call.id, result));
-                        },
+                    // Nada que cambie el proyecto corre sin el sí que pida el nivel. Un no
+                    // no rompe la conversación: se contesta a la llamada y el turno sigue,
+                    // porque un `tool_use` sin su resultado invalida el historial.
+                    let refusal = consent_for(s, call, raw);
+                    if (refusal != "") {
+                        say(ui.yellow("■ ") + ui.dim(refusal), raw);
+                        say("", raw);
+                        s.history.push(message.tool_result(call.id, refusal));
+                    } else {
+                        match (call_tool(s, call, raw)) {
+                            Option.None => {
+                                close_pending(s, calls, i);
+                                say(ui.yellow("■ ") + ui.dim("stopped by the user"), raw);
+                                say("", raw);
+                                return Result.Ok(turn);
+                            },
+                            Option.Some(result) => {
+                                show_result(result, raw);
+                                say("", raw);
+                                s.history.push(message.tool_result(call.id, result));
+                            },
+                        }
                     }
                     i = i + 1;
                 }

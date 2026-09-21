@@ -131,8 +131,36 @@ se suman las herramientas de cualquier [servidor MCP](#servidores-mcp).
   1.4s`). Lo anima una fibra aparte: funciona porque la petición HTTP y el drenado
   del proceso **aparcan** la fibra que espera. Sin terminal no se dibuja nada, así
   que la salida por tubería sigue limpia.
-- **Herramientas.** `read_file`, `write_file` y `list_dir` siempre; `run_command`
-  solo con `--allow-exec` (se ejecuta en streaming, con su plazo compuesto a mano:
+- **El agente es un invitado en el proyecto.** Toda ruta que nombra el modelo pasa por
+  `src/paths.ray` antes de que nadie abra nada, y se rechaza si sale del espacio de
+  trabajo (los `..` se deshacen antes de comparar), si sigue estando fuera cuando opina
+  el sistema de archivos (`fs.is_within_real`, de raylang 1.27.3: un enlace dentro de la
+  carpeta que apunta a `/etc` no cuela), si el proyecto la excluye en su `.agentignore`,
+  o si su nombre dice que guarda credenciales (`.env*`, `id_rsa`, `*.pem`, `credentials`,
+  `secrets.json`…). Ninguna de las cuatro se puede apagar con una bandera: no son
+  preguntas de consentimiento.
+- **Cuánto pasa sin un sí.** Tres niveles (`--autonomy`, `/autonomy`): `ask` —lo normal
+  con un terminal delante— pregunta antes de cada escritura y cada mandato; `edits`
+  aplica las escrituras y sigue preguntando lo demás; `auto` no pregunta. Se contesta con
+  una tecla: `y` esta vez, `a` siempre —y «siempre» presta el **programa**, no la línea
+  (`make test` y `make ci` son una sola decisión), y solo cuando el mandato es UN mandato:
+  una tubería, un `;` o un `$(…)` se preguntan por familiar que sea la primera palabra—,
+  cualquier otra cosa es no. Un no no rompe la conversación: se le contesta a la llamada y
+  el turno sigue. Sin terminal no hay a quién preguntar: se escribe pero no se ejecuta.
+- **Cuatro maneras de portarse.** `--mode` / `/mode`: `ask` contesta preguntas, `plan`
+  esboza los pasos sin darlos, `agent` (el de por defecto) lee, escribe y ejecuta, y
+  `debug` busca la causa antes que el remedio. No es solo un párrafo en el prompt: a los
+  dos modos que leen **no se les dan** las herramientas que cambian cosas, y pedirle por
+  favor a un modelo que no toque nada es una petición, mientras que no darle `write_file`
+  es un hecho.
+- **Cambios por trozo, no por archivo.** `edit_file` sustituye un texto exacto —copiado
+  del archivo, espacios incluidos— que tiene que aparecer **una sola vez**: ninguna vez
+  casi siempre significa que el modelo lo escribió de memoria, y varias que no ha dicho
+  cuál. Devuelve el parche con tres líneas de contexto, así que se ve dónde cayó. Cuesta
+  una fracción de los tokens de reescribir el archivo entero, y no puede perder lo que no
+  repitió.
+- **Herramientas.** `read_file`, `edit_file`, `write_file`, `list_dir` y `search`
+  siempre; `run_command` solo con `--allow-exec` (se ejecuta en streaming, con su plazo compuesto a mano:
   una fibra guardiana mata el grupo de proceso al vencer `timeout_ms`). Cada fallo — herramienta desconocida, argumentos rotos,
   error de E/S, `panic` — vuelve al modelo como texto para que se corrija, nunca
   tumba la sesión. `search` recorre el árbol saltándose la maquinaria (`.git`,
