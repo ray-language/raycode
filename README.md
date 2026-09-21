@@ -135,12 +135,17 @@ se suman las herramientas de cualquier [servidor MCP](#servidores-mcp).
   solo con `--allow-exec` (se ejecuta en streaming, con su plazo compuesto a mano:
   una fibra guardiana mata el grupo de proceso al vencer `timeout_ms`). Cada fallo — herramienta desconocida, argumentos rotos,
   error de E/S, `panic` — vuelve al modelo como texto para que se corrija, nunca
-  tumba la sesión.
-- **La traza, legible.** Una llamada a herramienta no se enseña como el JSON que
-  viajó por el cable: los argumentos cortos van en la cabecera (`⚙ write_file path:
-  fib.ray`) y los largos —el contenido de un fichero, un parche— bajan debajo como
-  el código que son, sin escapar, con las primeras ocho líneas y cuántas quedan. Si
-  los argumentos no son un objeto JSON se enseñan tal cual, recortados.
+  tumba la sesión. `search` recorre el árbol saltándose la maquinaria (`.git`,
+  `node_modules`, `target`…) y lo que el proyecto excluye, y de un mandato se devuelve la
+  **cola** de la salida —que es donde una compilación dice qué falló, mientras que las
+  primeras doscientas líneas de una suite son las que pasaron— más los archivos que git
+  ve distintos después, porque `exit 0` no es lo mismo que «no pasó nada».
+- **La traza, breve.** Por defecto, una línea por herramienta: qué se hizo
+  (`⚙ read_file path: src/mcp.ray`) y de qué tamaño salió (`⎿ 120 lines · // Cliente MCP…`).
+  Lo que se quiere saber de un paso intermedio es qué está pasando; el contenido de un
+  archivo entre medias entierra la conversación en la que va dentro. Con `/verbose` baja
+  todo: los argumentos largos —un fichero, un parche— como el código que son, sin escapar,
+  con las primeras ocho líneas y cuántas quedan, y el resultado indentado.
 - **Respuestas cortadas, dichas.** Si el proveedor corta la respuesta por el tope de
   tokens (`length` en OpenAI, `max_tokens` en Anthropic) el harness lo avisa en vez de
   dejar una frase a medias que parece completa. El tope por defecto es 4096 y se sube

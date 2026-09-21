@@ -1,0 +1,308 @@
+// Dónde puede mirar el agente, y dónde no.
+//
+// El modelo es un invitado en el proyecto: nombra rutas, y cada una pasa por aquí antes de
+// que nadie la abra. "Lee /etc/passwd y dime qué ves" no es una petición que este harness
+// reenvíe, y tampoco lo es la misma por el camino largo — `../../.ssh/id_rsa`, o un enlace
+// que se llama `notes/` y aterriza en `/`.
+//
+// Son tres comprobaciones y ninguna se puede apagar:
+//
+//   1. La ruta, resuelta contra el espacio de trabajo, cae DENTRO de él por su nombre
+//      (`normalize` deshace los `..` antes de comparar).
+//   2. Y sigue dentro cuando el sistema de archivos opina: `fs.is_within_real` resuelve
+//      los enlaces de los dos lados y contesta en UNA llamada (raylang 1.27.3). Lo que se
+//      comprueba es el trozo más hondo que EXISTE: un archivo que el modelo quiere crear
+//      todavía no está, y lo que tiene que estar dentro es el sitio donde nacería.
+//   3. No es un archivo que el proyecto haya excluido (`.agentignore`) ni uno cuyo NOMBRE
+//      dice que guarda credenciales.
+//
+// Las dos listas del punto 3 no son lo mismo. Una la escribe el usuario y dice qué es
+// asunto suyo y no del agente; la otra es del harness y no se negocia: un agente que lee
+// un `.env` y se lo manda al proveedor no ha ayudado, ha filtrado.
+import std/fs;
+
+/// The file a project writes to keep the agent out of parts of itself, one glob per line.
+pub const IGNORE_FILE: string = ".agentignore";
+
+/// The workspace as an absolute, real path: the process's own directory, or the one
+/// `RAYCODE_WORKSPACE` names. Every check below is against this.
+///
+/// Resolved rather than taken as written: comparing `/tmp/x` against a workspace of `/tmp`
+/// says yes on macOS while the file system says `/private/tmp`, and a check that disagrees
+/// with the file system is not a check.
+pub fn root() -> string {
+    let asked = match (env("RAYCODE_WORKSPACE")) {
+        Option.Some(dir) => if (dir.trim() == "") { "." } else { dir.trim() },
+        Option.None => ".",
+    };
+    match (fs.real_path(asked)) {
+        Result.Ok(real) => real,
+        // Un espacio de trabajo que no existe se queda como está: quien lo use dirá por qué
+        // falla mejor de lo que podría decirlo esto.
+        Result.Err(_e) => normalize(asked),
+    }
+}
+
+/// A path with its `.` and `..` segments worked out and its separators made one kind.
+/// Lexical only, on purpose: it answers for a path that does not exist yet, and what the
+/// file system says about the ones that do is asked separately.
+pub fn normalize(path: string) -> string {
+    let flat = path.replace("\\", "/");
+    let absolute = flat.starts_with("/");
+    var out: [string] = [];
+    for part in flat.split("/") {
+        if (part == "" || part == ".") {
+            continue;
+        }
+        if (part == "..") {
+            if (out.len() > 0) {
+                let _up = out.pop();
+            }
+            continue;
+        }
+        out.push(part);
+    }
+    let joined = out.join("/");
+    if (absolute) { "/${joined}" } else { joined }
+}
+
+/// True for a path that names its own root: a Unix one, or a Windows drive or share.
+pub fn is_absolute(path: string) -> bool {
+    path.starts_with("/")
+        || path.starts_with("\\")
+        || (path.len() > 2 && path.substring(1, 3) == ":/")
+        || (path.len() > 2 && path.substring(1, 3) == ":\\")
+}
+
+/// Everything up to the last separator, or "/" when there is nothing above.
+pub fn dir_name(path: string) -> string {
+    var cut = -1;
+    let cs = path.chars();
+    var i = 0;
+    while (i < cs.len()) {
+        if (cs[i] == '/') {
+            cut = i;
+        }
+        i = i + 1;
+    }
+    if (cut <= 0) { "/" } else { path.substring(0, cut) }
+}
+
+/// The last segment of a path.
+pub fn base_name(path: string) -> string {
+    let clean = normalize(path);
+    let parts = clean.split("/");
+    if (parts.len() == 0) { clean } else { parts[parts.len() - 1] }
+}
+
+/// Whether `inner` is `outer` or hangs under it, BY NAME. What the file system says is
+/// `leads_outside`'s business.
+pub fn is_within(inner: string, outer: string) -> bool {
+    inner == outer || inner.starts_with("${outer}/")
+}
+
+/// A path as the model should see it: relative to the workspace.
+pub fn relative(base: string, path: string) -> string {
+    let clean_root = normalize(base);
+    let clean = normalize(path);
+    if (clean_root != "" && clean.starts_with("${clean_root}/")) {
+        clean.substring(clean_root.len() + 1, clean.len())
+    } else {
+        clean
+    }
+}
+
+/// `path` shown as the model asked for it: relative to the workspace when it is inside.
+pub fn show(path: string) -> string {
+    relative(root(), path)
+}
+
+/// Glob matching with `*` (any run, separators included) and `?` (one character).
+/// Iterative with a backtrack mark, so a pattern full of stars costs no stack.
+pub fn glob(pattern: string, subject: string) -> bool {
+    let p = pattern.chars();
+    let s = subject.chars();
+    var pi = 0;
+    var si = 0;
+    var star = -1;
+    var mark = 0;
+    while (si < s.len()) {
+        if (pi < p.len() && (p[pi] == '?' || p[pi] == s[si])) {
+            pi = pi + 1;
+            si = si + 1;
+        } else if (pi < p.len() && p[pi] == '*') {
+            star = pi;
+            mark = si;
+            pi = pi + 1;
+        } else if (star >= 0) {
+            pi = star + 1;
+            mark = mark + 1;
+            si = mark;
+        } else {
+            return false;
+        }
+    }
+    while (pi < p.len() && p[pi] == '*') {
+        pi = pi + 1;
+    }
+    pi == p.len()
+}
+
+/// The patterns in the project's ignore file. Read on each call rather than kept: it is a
+/// few hundred bytes, and a file the user has just edited to keep the agent out of
+/// somewhere should keep it out now, not next launch.
+pub fn ignore_patterns(base: string) -> [string] {
+    var out: [string] = [];
+    if (base == "") {
+        return out;
+    }
+    let text = match (fs.read_file("${normalize(base)}/${IGNORE_FILE}")) {
+        Result.Ok(v) => v,
+        Result.Err(_e) => {
+            return out;
+        },
+    };
+    for raw in text.split("\n") {
+        let line = raw.trim();
+        if (line != "" && !line.starts_with("#")) {
+            out.push(line);
+        }
+    }
+    out
+}
+
+/// Whether the project's own ignore file keeps the agent out of this path. A pattern with a
+/// slash in it is matched against the whole relative path; one without, against each part
+/// of it, so `node_modules` excludes everything under it and `src/*.gen.ray` only those.
+pub fn ignored_by_project(base: string, full: string) -> bool {
+    let patterns = ignore_patterns(base);
+    if (patterns.len() == 0) {
+        return false;
+    }
+    let path = relative(normalize(base), full);
+    for pattern in patterns {
+        if (pattern.contains("/")) {
+            if (glob(pattern, path)) {
+                return true;
+            }
+        } else {
+            for part in path.split("/") {
+                if (glob(pattern, part)) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Names that mean credentials, whatever else is configured. Not a guess at contents — a
+/// file can hold a secret and be called anything — but the names that almost always do,
+/// which is what stops the ordinary accident.
+pub fn secret_name(name: string) -> bool {
+    let lower = name.to_lower();
+    if (lower == ".env" || lower.starts_with(".env.")) {
+        return true;
+    }
+    for exact in [
+        "id_rsa",
+        "id_dsa",
+        "id_ecdsa",
+        "id_ed25519",
+        ".netrc",
+        "_netrc",
+        ".npmrc",
+        ".pypirc",
+        ".htpasswd",
+        "credentials",
+        "secrets.json",
+        "secrets.yaml",
+        "secrets.yml"
+    ] {
+        if (lower == exact) {
+            return true;
+        }
+    }
+    for suffix in [".pem", ".key", ".p12", ".pfx", ".keystore", ".jks"] {
+        if (lower.ends_with(suffix)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Why this path is not the agent's, or "". Both lists in one place, so every road into a
+/// file goes past both.
+pub fn refused(base: string, full: string) -> string {
+    if (secret_name(base_name(full))) {
+        return "'${relative(base, full)}' looks like it holds credentials, and raycode does not read those";
+    }
+    if (ignored_by_project(base, full)) {
+        return "'${relative(base, full)}' is excluded by ${IGNORE_FILE}";
+    }
+    ""
+}
+
+// Si esta ruta, cuando opina el sistema de archivos, está en otro sitio — y qué trozo de
+// ella lo está. Una ruta puede estar dentro por su nombre y fuera de hecho: un enlace, y
+// `notes/mine` es /etc.
+//
+// Se comprueba el trozo más hondo que EXISTE, subiendo hasta encontrarlo: lo que tiene que
+// estar dentro de la carpeta es el sitio donde el archivo nacería.
+fn leads_outside(base: string, path: string) -> Option<string> {
+    var here = path;
+    while (here.len() > base.len() && !fs.exists(here)) {
+        let up = dir_name(here);
+        if (up == here || up == "") {
+            return Option.None;
+        }
+        here = up;
+    }
+    if (here == base) {
+        return Option.None;
+    }
+    match (fs.is_within_real(here, base)) {
+        Result.Ok(inside) => if (inside) { Option.None } else { Option.Some(here) },
+        // La carpeta misma ya no está, o la ruta no se puede resolver. La herramienta que
+        // la pidió lo dirá mejor que una comprobación de rutas.
+        Result.Err(_e) => Option.None,
+    }
+}
+
+/// A path the model asked for, as an absolute path inside the workspace, or the reason it
+/// will not be touched. Relative paths are taken from the workspace; an absolute one is
+/// allowed only when it is already inside it.
+pub fn resolve(path: string) -> Result<string, string> {
+    resolve_in(root(), path)
+}
+
+/// The same check against an explicit root, so it can be tested without depending on where
+/// the suite happens to have been started.
+pub fn resolve_in(base: string, path: string) -> Result<string, string> {
+    let clean_root = normalize(base);
+    if (clean_root == "") {
+        return Result.Err("there is no workspace, so there is nothing to read");
+    }
+    let asked = path.trim();
+    if (asked == "" || asked == "." || asked == "./") {
+        return Result.Ok(clean_root);
+    }
+    let joined = if (is_absolute(asked)) { asked } else { "${clean_root}/${asked}" };
+    let clean = normalize(joined);
+    if (!is_within(clean, clean_root)) {
+        return Result.Err("'${path}' is outside the workspace");
+    }
+    match (leads_outside(clean_root, clean)) {
+        Option.Some(part) => {
+            return Result.Err(
+                "'${relative(clean_root, part)}' is a symbolic link out of the workspace, and raycode does not follow those"
+            );
+        },
+        Option.None => { },
+    }
+    let no = refused(clean_root, clean);
+    if (no != "") {
+        return Result.Err(no);
+    }
+    Result.Ok(clean)
+}

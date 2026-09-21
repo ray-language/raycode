@@ -67,12 +67,17 @@ pub struct Answer {
     instructions: string,
 }
 
-/// A tool as the server declares it: raw name, description and its JSON Schema. It is
-/// `src/tools` who wraps it into the catalogue, so this module never imports it.
+/// A tool as the server declares it: raw name, description, its JSON Schema, and whether
+/// the server said it only reads (`annotations.readOnlyHint`). It is `src/tools` who wraps
+/// it into the catalogue, so this module never imports it.
 pub struct RemoteTool {
     name: string,
     description: string,
     schema: Json,
+    /// What the server CLAIMS. A hint, not a guarantee — but a server that says its tool
+    /// changes nothing has said the one thing that lets the harness run it unattended, and
+    /// one that says nothing is treated as if it changed everything.
+    read_only: bool,
 }
 
 /// The wire version this client speaks.
@@ -514,7 +519,14 @@ pub fn parse_tools(result: Json) -> Result<[RemoteTool], string> {
             Option.Some(s) => s,
             Option.None => obj(["type", "properties"], [jstr("object"), empty_object()]),
         };
-        tools.push(RemoteTool { name: name, description: description, schema: schema });
+        tools.push(
+            RemoteTool {
+                name: name,
+                description: description,
+                schema: schema,
+                read_only: read_only_hint(item)
+            }
+        );
     }
     Result.Ok(tools)
 }
@@ -523,6 +535,17 @@ pub fn parse_tools(result: Json) -> Result<[RemoteTool], string> {
 
 // El proceso vivo, propiedad exclusiva del actor: el handle, lo leído y aún no consumido
 // de su stdout, la siguiente `id` y lo que declaró al inicializarse.
+// Lo que el servidor declara en `annotations.readOnlyHint`. Ausente = no.
+fn read_only_hint(item: Json) -> bool {
+    match (json.member(item, "annotations")) {
+        Option.Some(a) => match (json.get_bool(a, "readOnlyHint")) {
+            Option.Some(v) => v,
+            Option.None => false,
+        },
+        Option.None => false,
+    }
+}
+
 struct Live {
     proc: process.Proc,
     pending: bytes,

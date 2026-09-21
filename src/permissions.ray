@@ -1,0 +1,183 @@
+// Cuánto hace el agente sin preguntar.
+//
+// `src/paths` dice qué rutas son del agente; esto dice qué pasa sin un sí. Son preguntas
+// distintas y se contestan por separado: quien se fía de que edite archivos no se fía por
+// ello de que ejecute mandatos, y quien ya le deja lanzar la suite de pruebas sigue
+// queriendo ver qué se va a borrar.
+//
+// Tres niveles y nada entre medias:
+//
+//   ASK    no pasa nada sin acuerdo. Cada escritura se ve, cada mandato se pregunta.
+//          Es donde empieza una conversación.
+//   EDITS  lo que el agente escribe en archivos se aplica solo; lo que no es escribir
+//          sigue preguntando.
+//   AUTO   los mandatos también corren sin preguntar.
+//
+// Lo que NO se dobla con ninguno de los tres: una ruta fuera del espacio de trabajo, un
+// archivo que `.agentignore` excluye y cualquiera que parezca una credencial se rechazan en
+// todos los niveles. No son preguntas de consentimiento —no se está preguntando a nadie— y
+// un nivel no es un argumento para leer una clave privada.
+
+/// What a tool does to the workspace, which is what decides whether it needs a yes.
+/// A builtin declares its own; an MCP tool is read-only when its server said so
+/// (`annotations.readOnlyHint`) and is treated as the most dangerous kind otherwise,
+/// because nothing here can tell what somebody else's tool is about to do.
+pub const READ: string = "read";
+
+pub const WRITE: string = "write";
+
+pub const EXEC: string = "exec";
+
+pub const ASK: string = "ask";
+
+pub const EDITS: string = "edits";
+
+pub const AUTO: string = "auto";
+
+pub struct Level {
+    id: string,
+    label: string,
+    note: string,
+}
+
+pub fn all() -> [Level] {
+    [
+        Level {
+            id: ASK,
+            label: "Ask first",
+            note: "Every write and every command is agreed to first."
+        },
+        Level {
+            id: EDITS,
+            label: "Apply edits",
+            note: "Files are written without asking; commands still ask."
+        },
+        Level {
+            id: AUTO,
+            label: "Run on its own",
+            note: "Files are written and commands run without asking."
+        }
+    ]
+}
+
+pub fn known(id: string) -> bool {
+    for l in all() {
+        if (l.id == id) {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn find(id: string) -> Level {
+    for l in all() {
+        if (l.id == id) {
+            return l;
+        }
+    }
+    Level { id: ASK, label: "Ask first", note: "Every write and every command is agreed to first." }
+}
+
+/// The ids, for an error message that has to list them.
+pub fn ids() -> [string] {
+    var out: [string] = [];
+    for l in all() {
+        out.push(l.id);
+    }
+    out
+}
+
+/// Whether a tool of this kind runs without being asked about at this level.
+pub fn unattended(level: string, risk: string) -> bool {
+    if (risk == READ) {
+        return true;
+    }
+    if (level == AUTO) {
+        return true;
+    }
+    if (level == EDITS) {
+        return risk == WRITE;
+    }
+    false
+}
+
+/// What the model is told. Nothing at ASK: that is the shape of the conversation it already
+/// knows — it proposes, the user decides. The other two are worth saying, because a model
+/// that thinks its writes are waiting for a yes writes differently.
+pub fn prompt_for(level: string) -> string {
+    if (level == EDITS) {
+        return "The files you write are saved as soon as you write them, so go one at a "
+            + "time and read a file again before changing it twice. Running a command still "
+            + "waits for the user.";
+    }
+    if (level == AUTO) {
+        return "Your writes are saved and your commands are run without waiting for the "
+            + "user, so be exact and go in small steps: read before you write, run the "
+            + "narrowest command that answers the question, and say what you did. Stop and "
+            + "ask when something is destructive or when the answer surprises you.";
+    }
+    ""
+}
+
+// --------------------------------------------------------- la lista de mandatos
+
+// Qué se le presta al agente cuando el usuario dice «siempre».
+//
+// Es el PROGRAMA y no la línea de órdenes, porque una línea nunca es la misma dos veces:
+// `make test`, `make ci` y `make fmt` son una sola decisión para cualquiera que no sea un
+// ordenador. Y vale solo para un mandato que sea UN mandato: un operador del shell
+// significa que va a correr algo más, y eso no es lo que nadie permitió.
+
+/// The program a command runs: its first word, with any leading environment assignment and
+/// any directory stripped off, since `/usr/bin/make` and `make` are the same decision.
+pub fn program_of(command: string) -> string {
+    for word in command.trim().split(" ") {
+        let w = word.trim();
+        if (w == "") {
+            continue;
+        }
+        if (is_assignment(w)) {
+            continue;
+        }
+        let parts = w.split("/");
+        return parts[parts.len() - 1];
+    }
+    ""
+}
+
+// `FOO=bar make test`: la asignación no es el programa. Lo es cuando el nombre viene antes
+// de cualquier barra — que es lo que la distingue de una ruta con un igual dentro.
+fn is_assignment(word: string) -> bool {
+    match (word.index_of("=")) {
+        Option.Some(at) => {
+            if (at == 0) {
+                return false;
+            }
+            match (word.index_of("/")) {
+                Option.Some(slash) => at < slash,
+                Option.None => true,
+            }
+        },
+        Option.None => false,
+    }
+}
+
+/// Whether a command is ONE command. Anything that lets a second one run — a pipe, a chain,
+/// a redirection, a substitution — is asked about however familiar its first word is.
+pub fn is_simple(command: string) -> bool {
+    for mark in [";", "&", "|", "`", "$(", ">", "<", "\n"] {
+        if (command.contains(mark)) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether this command may run without asking, given what has been allowed so far.
+pub fn allowed(programs: [string], command: string) -> bool {
+    if (!is_simple(command)) {
+        return false;
+    }
+    let program = program_of(command);
+    program != "" && programs.contains(program)
+}

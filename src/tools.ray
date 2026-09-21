@@ -3,9 +3,12 @@
 // argumentos ya parseados y devuelve texto para el turno `tool`.
 import std/json;
 import std/fs;
+import src/paths;
+import src/permissions;
 import std/process;
 import std/math;
 import std/time;
+import std/regex;
 import src/ui;
 import src/mcp;
 from src/mcp import Server;
@@ -22,6 +25,9 @@ pub struct Tool {
     description: string,
     schema: Json,
     source: string,
+    /// What it does to the workspace — `permissions.READ`, `WRITE` or `EXEC` — which is
+    /// what decides whether the user is asked before it runs.
+    risk: string,
 }
 
 // Un esquema escrito como literal JSON. Es un error de programación si no parsea.
@@ -118,7 +124,10 @@ fn read_capped(path: string) -> Result<string, string> {
 
 fn tool_read_file(a: Json) -> Result<string, string> {
     let asked = need_string(a, "path")?;
-    let path = ui.resolve_path(asked);
+    let path = paths.resolve(asked)?;
+    if (fs.is_dir(path)) {
+        return Result.Err("'${asked}' is a directory; use list_dir for it");
+    }
     let content = read_capped(path)?;
     let lines = content.split("\n");
     let start = math.max(1, int_or(a, "start_line", 1));
@@ -149,8 +158,136 @@ fn tool_read_file(a: Json) -> Result<string, string> {
 fn tool_write_file(a: Json) -> Result<string, string> {
     let asked = need_string(a, "path")?;
     let content = need_string(a, "content")?;
-    let written = fs.write_file(ui.resolve_path(asked), content)?;
-    Result.Ok("wrote ${written} bytes to ${asked}")
+    let path = paths.resolve(asked)?;
+    let written = fs.write_file(path, content)?;
+    Result.Ok("wrote ${written} bytes to ${paths.show(path)}")
+}
+
+// Cuántas líneas de contexto lleva el parche que se le devuelve al modelo.
+const EDIT_CONTEXT: int = 3;
+
+// Cuántas veces aparece `needle` en `text`.
+fn occurrences(text: string, needle: string) -> int {
+    if (needle == "") {
+        return 0;
+    }
+    var count = 0;
+    var from = 0;
+    var looking = true;
+    while (looking) {
+        match (text.substring(from, text.len()).index_of(needle)) {
+            Option.Some(at) => {
+                count = count + 1;
+                from = from + at + needle.len();
+            },
+            Option.None => {
+                looking = false;
+            },
+        }
+    }
+    count
+}
+
+// En qué línea (contando desde 1) cae el carácter `at`.
+fn line_at(text: string, at: int) -> int {
+    var line = 1;
+    var i = 0;
+    while (i < at && i < text.len()) {
+        if (text.substring(i, i + 1) == "\n") {
+            line = line + 1;
+        }
+        i = i + 1;
+    }
+    line
+}
+
+// El parche que se le enseña al modelo: las líneas que se van, las que entran, y unas
+// pocas alrededor para que se vea DÓNDE. Es lo que confirma que el cambio cayó donde se
+// quería, que es justo lo que una escritura del archivo entero no puede decir.
+fn patch_of(before: string, after: string, at: int) -> string {
+    let first = line_at(before, at);
+    let old_lines = before.split("\n");
+    let new_lines = after.split("\n");
+    // La última línea que difiere, contada desde el final de cada lado.
+    var tail = 0;
+    while (tail < old_lines.len()
+        && tail < new_lines.len()
+        && old_lines[old_lines.len() - 1 - tail] == new_lines[new_lines.len() - 1 - tail]) {
+        tail = tail + 1;
+    }
+    var out: [string] = [];
+    var i = math.max(0, first - 1 - EDIT_CONTEXT);
+    while (i < first - 1) {
+        out.push("  ${i + 1}: ${old_lines[i]}");
+        i = i + 1;
+    }
+    var j = first - 1;
+    while (j < old_lines.len() - tail) {
+        out.push(ui.red("- ") + "${j + 1}: ${old_lines[j]}");
+        j = j + 1;
+    }
+    var k = first - 1;
+    while (k < new_lines.len() - tail) {
+        out.push(ui.green("+ ") + "${k + 1}: ${new_lines[k]}");
+        k = k + 1;
+    }
+    var after_at = old_lines.len() - tail;
+    var shown = 0;
+    while (after_at < old_lines.len() && shown < EDIT_CONTEXT) {
+        out.push("  ${after_at + 1}: ${old_lines[after_at]}");
+        after_at = after_at + 1;
+        shown = shown + 1;
+    }
+    out.join("\n")
+}
+
+// Cambiar un trozo de un archivo, en vez de reescribirlo entero.
+//
+// El texto a sustituir tiene que aparecer EXACTAMENTE UNA VEZ. Ninguna vez casi siempre
+// significa que el modelo lo escribió de memoria en vez de copiarlo; varias, que no ha
+// dicho cuál de ellas — y adivinar es lo único que no puede hacer un editor.
+fn tool_edit_file(a: Json) -> Result<string, string> {
+    let asked = need_string(a, "path")?;
+    let find = need_string(a, "find")?;
+    let replace = need_string(a, "replace")?;
+    let path = paths.resolve(asked)?;
+    if (!fs.is_file(path)) {
+        return Result.Err("'${asked}' is not a file; create_file writes a new one");
+    }
+    let before = fs.read_file(path)?;
+    let count = occurrences(before, find);
+    if (count == 0) {
+        return Result.Err(
+            "that text is not in "
+                + to_string(paths.show(path))
+                + ". Read the file and copy the text to "
+                + "replace exactly as it appears, whitespace and all."
+        );
+    }
+    if (count > 1) {
+        return Result.Err(
+            "that text appears "
+                + to_string(count)
+                + " times in "
+                + to_string(paths.show(path))
+                + ". Include enough of the "
+                + "surrounding lines to name one place."
+        );
+    }
+    let at = match (before.index_of(find)) {
+        Option.Some(i) => i,
+        Option.None => 0,
+    };
+    let after = before.substring(0, at) + replace + before.substring(at + find.len(), before.len());
+    let _w = fs.write_file(path, after)?;
+    Result.Ok(
+        "edited "
+            + to_string(paths.show(path))
+            + " at line "
+            + to_string(line_at(before, at))
+            + "\n"
+            + cap(patch_of(before, after, at))
+    )
 }
 
 fn tool_list_dir(a: Json) -> Result<string, string> {
@@ -158,7 +295,7 @@ fn tool_list_dir(a: Json) -> Result<string, string> {
         Option.Some(p) => p,
         Option.None => ".",
     };
-    let path = ui.resolve_path(asked);
+    let path = paths.resolve(asked)?;
     let entries = fs.list_dir(path)?;
     var out: [string] = [];
     for e in entries {
@@ -179,12 +316,138 @@ fn tool_list_dir(a: Json) -> Result<string, string> {
     }
 }
 
+// --------------------------------------------------------------------- buscar
+
+// Cuántas coincidencias devuelve una búsqueda, y cuánto se mira de un archivo.
+const MAX_HITS: int = 120;
+
+const MAX_SEARCHED: int = 262144;
+
+// Lo que no se recorre nunca: directorios que son maquinaria y no el proyecto, y que quien
+// pide «los archivos» no está pidiendo.
+fn machinery() -> [string] {
+    [".git", "node_modules", ".ray-deps", "target", "dist", "build", "__pycache__", ".venv"]
+}
+
+// Un archivo binario no es texto que buscar, y volcarlo en la conversación sería peor que
+// inútil. El octeto nulo es lo que los distingue en la práctica.
+fn looks_binary(text: string) -> bool {
+    match (text.index_of("\0")) {
+        Option.Some(_) => true,
+        Option.None => false,
+    }
+}
+
+// Busca en un archivo y añade lo que encuentre. Devuelve cuántas van.
+fn search_file(full: string, pattern: string, is_regex: bool, hits: [string], found: int) -> int {
+    var count = found;
+    let size = match (fs.file_size(full)) {
+        Result.Ok(n) => n,
+        Result.Err(_) => 0,
+    };
+    if (size > MAX_SEARCHED || size == 0) {
+        return count;
+    }
+    let text = match (fs.read_file(full)) {
+        Result.Ok(v) => v,
+        Result.Err(_) => {
+            return count;
+        },
+    };
+    if (looks_binary(text)) {
+        return count;
+    }
+    var line = 0;
+    for raw in text.split("\n") {
+        line = line + 1;
+        if (count >= MAX_HITS) {
+            return count;
+        }
+        let matched = if (is_regex) { regex.search(pattern, raw) } else { raw.contains(pattern) };
+        if (matched) {
+            hits.push("${paths.show(full)}:${line}: " + ui.clip(raw.trim(), 200));
+            count = count + 1;
+        }
+    }
+    count
+}
+
+// Recorre el árbol desde `dir`, saltándose la maquinaria y lo que el proyecto excluye.
+fn search_tree(
+    root: string,
+    dir: string,
+    pattern: string,
+    is_regex: bool,
+    hits: [string],
+    found: int
+) -> int {
+    var count = found;
+    let entries = match (fs.list_dir(dir)) {
+        Result.Ok(v) => v,
+        Result.Err(_) => {
+            return count;
+        },
+    };
+    for name in entries.sort() {
+        if (count >= MAX_HITS) {
+            return count;
+        }
+        let full = "${dir}/${name}";
+        if (fs.is_dir(full)) {
+            if (!machinery().contains(name) && !paths.ignored_by_project(root, full)) {
+                count = search_tree(root, full, pattern, is_regex, hits, count);
+            }
+        } else if (paths.refused(root, full) == "") {
+            count = search_file(full, pattern, is_regex, hits, count);
+        }
+    }
+    count
+}
+
+// Dónde está lo que el modelo busca, para que no tenga que leerse archivos enteros
+// adivinando. Sin esto, la única forma de encontrar algo es leer, y leer cuesta contexto en
+// cada turno de la conversación que venga después.
+fn tool_search(a: Json) -> Result<string, string> {
+    let query = need_string(a, "query")?;
+    let is_regex = match (json.get_bool(a, "is_regex")) {
+        Option.Some(v) => v,
+        Option.None => false,
+    };
+    if (is_regex) {
+        match (regex.compile(query)) {
+            Result.Ok(_) => { },
+            Result.Err(e) => {
+                return Result.Err("that is not a valid regular expression: ${e}");
+            },
+        }
+    }
+    let where = match (json.get_string(a, "path")) {
+        Option.Some(p) => p,
+        Option.None => ".",
+    };
+    let root = paths.root();
+    let start = paths.resolve(where)?;
+    var hits: [string] = [];
+    let found = if (fs.is_dir(start)) {
+        search_tree(root, start, query, is_regex, hits, 0)
+    } else {
+        search_file(start, query, is_regex, hits, 0)
+    };
+    if (found == 0) {
+        return Result.Ok("no match for '${query}'");
+    }
+    let more = if (found >= MAX_HITS) { "\n… [stopped at ${MAX_HITS} matches]" } else { "" };
+    Result.Ok(cap(hits.join("\n")) + more)
+}
+
 fn tool_run_command(a: Json) -> Result<string, string> {
     let command = need_string(a, "command")?;
     let timeout = int_or(a, "timeout_ms", 30000);
+    // Cómo estaba el proyecto antes, para poder decir después qué tocó el mandato.
+    let before = git_status();
     // Se lanza en STREAMING, no con `run()`: drenar el canal aparca la fibra y deja correr
     // al indicador de actividad, mientras que `run()` bloquearía el planificador entero.
-    let p = process.cmd("sh", ["-c", command]).dir(ui.workspace()).merge_output().stream()?;
+    let p = process.cmd("sh", ["-c", command]).dir(paths.root()).merge_output().stream()?;
     let started = time.monotonic();
     // El streaming no admite `timeout_ms`, así que el plazo se compone a mano: una fibra
     // que espera y mata al grupo de proceso (matar tras `wait` no hace nada).
@@ -214,7 +477,81 @@ fn tool_run_command(a: Json) -> Result<string, string> {
     };
     let note = if (elapsed >= timeout) { " (timed out after ${timeout}ms)" } else { "" };
     let text = from_utf8(captured)?;
-    Result.Ok(cap("[${status}${note}]\n" + text))
+    let changed = changed_between(before, git_status());
+    let said = if (changed.len() == 0) { "" } else { "\nchanged: " + changed.join(", ") };
+    Result.Ok("[${status}${note}]\n" + tail(text) + said)
+}
+
+// La COLA de la salida, no la cabeza. Una compilación que falla dice qué pasó en sus
+// últimas líneas, y las primeras doscientas de una suite de pruebas son las que pasaron.
+fn tail(text: string) -> string {
+    if (text.len() <= MAX_OUTPUT) {
+        return text;
+    }
+    let cut = text.len() - MAX_OUTPUT;
+    "… [truncated, ${cut} earlier characters]\n" + text.substring(cut, text.len())
+}
+
+// Lo que git dice del proyecto ahora, línea por línea; vacío si esto no es un repositorio
+// o si no hay git. Es una foto para comparar, no un diagnóstico.
+fn git_status() -> [string] {
+    let none: [string] = [];
+    match (process.cmd("git", ["status", "--porcelain"]).dir(paths.root()).run()) {
+        Result.Ok(out) => match (out.exit) {
+            process.Exit.Code(code) => if (code != 0) {
+                none
+            } else {
+                var lines: [string] = [];
+                for line in from_utf8(out.stdout).unwrap_or("").split("\n") {
+                    if (line.trim() != "") {
+                        lines.push(line.trim());
+                    }
+                }
+                lines
+            },
+            _ => none,
+        },
+        Result.Err(_) => none,
+    }
+}
+
+/// The paths git talks about differently after a command than before it. What the model is
+/// told once a command has run, because "exit 0" is not the same as "nothing happened" and
+/// it has no other way to find out.
+pub fn changed_between(before: [string], after: [string]) -> [string] {
+    var out: [string] = [];
+    for line in after {
+        if (!before.contains(line)) {
+            let path = path_of(line);
+            if (path != "" && !out.contains(path)) {
+                out.push(path);
+            }
+        }
+    }
+    // Y lo que dejó de aparecer: un archivo que se añadió al índice, o cuyo cambio se
+    // deshizo, también es algo que pasó.
+    for line in before {
+        if (!after.contains(line)) {
+            let path = path_of(line);
+            if (path != "" && !out.contains(path)) {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+// La ruta de una línea de `git status --porcelain`: dos columnas de estado, un espacio, y
+// el resto. Un renombrado se da como "viejo -> nuevo"; el nuevo es el que importa.
+fn path_of(line: string) -> string {
+    if (line.len() < 4) {
+        return "";
+    }
+    let rest = line.substring(3, line.len()).trim();
+    match (rest.index_of(" -> ")) {
+        Option.Some(at) => rest.substring(at + 4, rest.len()).trim(),
+        Option.None => rest,
+    }
 }
 
 /// The tools offered to the model. `run_command` is only present when the harness was
@@ -223,19 +560,39 @@ pub fn registry(allow_exec: bool) -> [Tool] {
     var tools: [Tool] = [
         Tool {
             name: "read_file",
-            description: "Read a UTF-8 text file from the workspace, numbered by line. Use start_line/max_lines to page through big files.",
+            description: "Read a UTF-8 text file from the workspace, numbered by line. Use start_line/max_lines to page through big files. Paths are relative to the workspace and may not leave it.",
             schema: schema_of(
                 `{"type":"object","properties":{"path":{"type":"string","description":"Path to the file, relative to the working directory"},"start_line":{"type":"integer","description":"First line to show (1-based, default 1)"},"max_lines":{"type":"integer","description":"How many lines to show (default 400)"}},"required":["path"]}`
             ),
-            source: ""
+            source: "",
+            risk: permissions.READ
         },
         Tool {
             name: "write_file",
-            description: "Create or overwrite a text file with the given content. The parent directory must exist.",
+            description: "Create a file, or replace one whole. The parent directory must exist. For a change to a file that already exists, use edit_file instead: replacing a whole file to change three lines costs the whole file in tokens and risks losing what you did not repeat.",
             schema: schema_of(
                 `{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to write"},"content":{"type":"string","description":"Full new content of the file"}},"required":["path","content"]}`
             ),
-            source: ""
+            source: "",
+            risk: permissions.WRITE
+        },
+        Tool {
+            name: "edit_file",
+            description: "Change part of a file: 'find' is the exact text to replace, copied from the file whitespace and all, and 'replace' is what goes in its place. The text must appear exactly once, so include enough of the surrounding lines to name one place. Prefer this to write_file for anything that already exists: it costs a fraction of the tokens and cannot lose the rest of the file.",
+            schema: schema_of(
+                `{"type":"object","properties":{"path":{"type":"string","description":"Path to the file, relative to the workspace"},"find":{"type":"string","description":"The exact text to replace, as it appears in the file"},"replace":{"type":"string","description":"What to put in its place; empty to delete the text"}},"required":["path","find","replace"]}`
+            ),
+            source: "",
+            risk: permissions.WRITE
+        },
+        Tool {
+            name: "search",
+            description: "Search the workspace for a string (or a regular expression) and get back the matching lines with their file and line number. Use it to find where something is defined or used before reading whole files.",
+            schema: schema_of(
+                `{"type":"object","properties":{"query":{"type":"string","description":"What to look for"},"is_regex":{"type":"boolean","description":"Whether the query is a regular expression; false by default"},"path":{"type":"string","description":"Where to look, relative to the workspace; everything by default"}},"required":["query"]}`
+            ),
+            source: "",
+            risk: permissions.READ
         },
         Tool {
             name: "list_dir",
@@ -243,18 +600,20 @@ pub fn registry(allow_exec: bool) -> [Tool] {
             schema: schema_of(
                 `{"type":"object","properties":{"path":{"type":"string","description":"Directory to list (default '.')"}},"required":[]}`
             ),
-            source: ""
+            source: "",
+            risk: permissions.READ
         }
     ];
     if (allow_exec) {
         tools.push(
             Tool {
                 name: "run_command",
-                description: "Run a shell command in the working directory and return its merged output and exit status.",
+                description: "Run a shell command in the workspace and get back its merged output, its exit status, and which files git says are different afterwards. The output is clipped to its tail, which is where a failure says what went wrong. Ask for what you need in one command rather than many.",
                 schema: schema_of(
                     `{"type":"object","properties":{"command":{"type":"string","description":"The shell command line to run"},"timeout_ms":{"type":"integer","description":"Kill the command after this many milliseconds (default 30000)"}},"required":["command"]}`
                 ),
-                source: ""
+                source: "",
+                risk: permissions.EXEC
             }
         );
     }
@@ -271,12 +630,14 @@ pub fn from_servers(servers: [Server]) -> [Tool] {
             Result.Ok(remote) => {
                 for r in remote {
                     tools.push(
-                        Tool {
-                            name: mcp.tool_name(s.name, r.name),
-                            description: r.description,
-                            schema: r.schema,
-                            source: s.name
-                        }
+                        Tool { name: mcp.tool_name(s.name, r.name), description: r.description, schema: r.schema, source: s.name, risk: if (r.read_only) {
+                            // Lo que el servidor no declara de solo lectura se trata como lo
+                            // más peligroso que hay: nadie aquí sabe qué hace la herramienta
+                            // de otro programa.
+                            permissions.READ
+                        } else {
+                            permissions.EXEC
+                        } }
                     );
                 }
             },
@@ -296,11 +657,13 @@ pub fn from_servers(servers: [Server]) -> [Tool] {
         tools.push(
             Tool {
                 name: READ_RESOURCE,
-                description: "Read a resource published by an MCP server, by URI. Available resources:\n" + lines.join("\n"),
+                description: "Read a resource published by an MCP server, by URI. Available resources:\n"
+                    + lines.join("\n"),
                 schema: schema_of(
                     `{"type":"object","properties":{"uri":{"type":"string","description":"The resource URI, exactly as listed"}},"required":["uri"]}`
                 ),
-                source: "mcp"
+                source: "mcp",
+                risk: permissions.READ
             }
         );
     }
@@ -328,6 +691,33 @@ fn tool_read_resource(servers: [Server], a: Json) -> Result<string, string> {
             text.substring(0, MAX_RESOURCE) + "\n… [truncated, ${text.len() - MAX_RESOURCE} more characters]"
         )
     }
+}
+
+/// The catalogue as a mode sees it. A mode that writes gets everything; one that does not
+/// gets only what reads, and that is a fact about the request rather than a request of its
+/// own — a model cannot edit a file with a tool it was not given.
+pub fn for_mode(all: [Tool], writes: bool) -> [Tool] {
+    if (writes) {
+        return all;
+    }
+    var out: [Tool] = [];
+    for t in all {
+        if (t.risk == permissions.READ) {
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// What a tool by that name does to the workspace. An unknown name is treated as the most
+/// dangerous kind: a call the catalogue cannot explain is not one to run unattended.
+pub fn risk_of(tools: [Tool], name: string) -> string {
+    for t in tools {
+        if (t.name == name) {
+            return t.risk;
+        }
+    }
+    permissions.EXEC
 }
 
 /// True when the registry offers a tool by that name.
@@ -373,6 +763,10 @@ fn dispatch(servers: [Server], name: string, arguments: Json) -> Result<string, 
         tool_read_file(arguments)
     } else if (name == "write_file") {
         tool_write_file(arguments)
+    } else if (name == "edit_file") {
+        tool_edit_file(arguments)
+    } else if (name == "search") {
+        tool_search(arguments)
     } else if (name == "list_dir") {
         tool_list_dir(arguments)
     } else if (name == "run_command") {

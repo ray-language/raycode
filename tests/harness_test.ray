@@ -17,6 +17,8 @@ import std/json;
 import std/process;
 import net/webserver;
 import src/picker;
+import src/paths;
+import src/permissions;
 import src/agent;
 from src/config import Api;
 
@@ -235,8 +237,8 @@ fn tool_failures_come_back_as_text() {
 
 @test
 fn the_shell_tool_is_opt_in() {
-    assert_eq(tools.registry(false).len(), 3);
-    assert_eq(tools.registry(true).len(), 4);
+    assert_eq(tools.registry(false).len(), 5);
+    assert_eq(tools.registry(true).len(), 6);
     assert(tools.offers(tools.registry(true), "run_command"));
     assert(!tools.offers(tools.registry(false), "run_command"));
     // Y sin `--allow-exec` no se ejecuta aunque el modelo lo pida por su nombre.
@@ -659,7 +661,9 @@ fn markdown_respects_the_document_over_its_own_conventions() {
 fn reading_a_huge_file_stays_bounded() {
     // Un archivo de 3 MiB: la herramienta lee por trozos y para en su tope, en vez de
     // traerlo entero a memoria. Y lo dice, para que el modelo no crea que lo ha visto todo.
-    let path = "/tmp/raycode_huge.txt";
+    // Dentro del espacio de trabajo: desde que las rutas están confinadas, /tmp no es del
+    // agente, y este test es sobre el tope de lectura, no sobre el confinamiento.
+    let path = "raycode_huge.tmp";
     var block = "";
     var i = 0;
     while (i < 1024) {
@@ -681,7 +685,7 @@ fn reading_a_huge_file_stays_bounded() {
         reg,
         no_servers(),
         "read_file",
-        `{"path":"/tmp/raycode_huge.txt","max_lines":5}`
+        `{"path":"raycode_huge.tmp","max_lines":5}`
     );
     assert(out.contains("1: 0123456789"));
     assert(out.contains("were read"));
@@ -690,17 +694,221 @@ fn reading_a_huge_file_stays_bounded() {
 
 @test
 fn paths_resolve_against_the_workspace() {
-    // Sin espacio de trabajo aparte (lo normal, y como corre `ray test`), las rutas van
-    // tal cual: el directorio del proceso YA es el del usuario.
-    assert_eq(ui.workspace(), ".");
-    assert_eq(ui.resolve_path("src/agent.ray"), "src/agent.ray");
-    assert_eq(ui.resolve_path("."), ".");
-    assert_eq(ui.resolve_path("/etc/hosts"), "/etc/hosts");
-    // Y las herramientas siguen leyendo del directorio actual.
+    // El espacio de trabajo es el directorio del proceso, resuelto de verdad: es contra
+    // esto contra lo que se compara todo lo demás.
+    assert(paths.root().starts_with("/"));
     let reg = tools.registry(false);
     assert(tools
         .execute(reg, no_servers(), "read_file", `{"path":"ray.toml"}`)
         .contains("raycode"));
+}
+
+@test
+fn a_path_out_of_the_workspace_is_refused() {
+    let root = "/home/someone/project";
+    // Lo de dentro entra, con "." y ".." deshechos antes de comparar.
+    match (paths.resolve_in(root, "src/../src/agent.ray")) {
+        Result.Ok(full) => assert_eq(full, "/home/someone/project/src/agent.ray"),
+        Result.Err(e) => panic(e),
+    }
+    // Lo de fuera no, ni por el camino corto ni por el largo.
+    for outside in ["/etc/hosts", "../../etc/hosts", "src/../../../etc/hosts"] {
+        match (paths.resolve_in(root, outside)) {
+            Result.Ok(full) => panic("'${outside}' should not have resolved to ${full}"),
+            Result.Err(e) => assert(e.contains("outside the workspace")),
+        }
+    }
+    // Una ruta absoluta que YA está dentro es legítima: es la misma que la relativa.
+    match (paths.resolve_in(root, "/home/someone/project/README.md")) {
+        Result.Ok(full) => assert_eq(full, "/home/someone/project/README.md"),
+        Result.Err(e) => panic(e),
+    }
+}
+
+@test
+fn a_symlink_out_of_the_workspace_is_refused() {
+    // Dentro por su nombre y fuera de hecho: lo que `fs.is_within_real` contesta y una
+    // comparación de cadenas no.
+    let root = match (fs.make_temp_dir("raycode_link")) {
+        Result.Ok(dir) => dir,
+        Result.Err(e) => panic(e),
+    };
+    let real_root = match (fs.real_path(root)) {
+        Result.Ok(v) => v,
+        Result.Err(e) => panic(e),
+    };
+    let _w = fs.write_file("${real_root}/inside.txt", "mine");
+    // Un enlace a /etc dentro de la carpeta. Sin `ln` no hay nada que probar aquí.
+    let made = process.cmd("ln", ["-s", "/etc", "${real_root}/escape"]).run();
+    match (made) {
+        Result.Ok(_) => {
+            match (paths.resolve_in(real_root, "escape/hosts")) {
+                Result.Ok(full) => panic("the symlink should not have resolved to ${full}"),
+                Result.Err(e) => assert(e.contains("symbolic link")),
+            }
+        },
+        Result.Err(_e) => { },
+    }
+    // Y lo que de verdad está dentro sigue estándolo.
+    match (paths.resolve_in(real_root, "inside.txt")) {
+        Result.Ok(full) => assert_eq(full, "${real_root}/inside.txt"),
+        Result.Err(e) => panic(e),
+    }
+    let _r = fs.remove_all(real_root);
+}
+
+@test
+fn credentials_and_excluded_files_are_never_read() {
+    let root = "/home/someone/project";
+    for secret in [".env", ".env.production", "id_rsa", "deploy.pem", "config/secrets.json"] {
+        match (paths.resolve_in(root, secret)) {
+            Result.Ok(_) => panic("'${secret}' should have been refused"),
+            Result.Err(e) => assert(e.contains("credentials")),
+        }
+    }
+    // Y un nombre que solo se le parece, no.
+    match (paths.resolve_in(root, "src/environment.ray")) {
+        Result.Ok(_) => { },
+        Result.Err(e) => panic(e),
+    }
+}
+
+@test
+fn the_project_ignore_file_keeps_the_agent_out() {
+    let root = match (fs.make_temp_dir("raycode_ignore")) {
+        Result.Ok(dir) => dir,
+        Result.Err(e) => panic(e),
+    };
+    let _i = fs.write_file("${root}/${paths.IGNORE_FILE}", "# mine\nprivate\nsrc/*.gen.ray\n");
+    // Un patrón sin barra excluye ese nombre en cualquier nivel...
+    match (paths.resolve_in(root, "private/notes.md")) {
+        Result.Ok(_) => panic("private/ should have been excluded"),
+        Result.Err(e) => assert(e.contains(paths.IGNORE_FILE)),
+    }
+    // ...y uno con barra, solo donde dice.
+    match (paths.resolve_in(root, "src/parser.gen.ray")) {
+        Result.Ok(_) => panic("src/*.gen.ray should have been excluded"),
+        Result.Err(e) => assert(e.contains(paths.IGNORE_FILE)),
+    }
+    match (paths.resolve_in(root, "src/parser.ray")) {
+        Result.Ok(_) => { },
+        Result.Err(e) => panic(e),
+    }
+    let _r = fs.remove_all(root);
+}
+
+@test
+fn a_write_outside_the_workspace_never_happens() {
+    // La comprobación está en la herramienta, no solo en quien la llama: el modelo puede
+    // nombrar lo que quiera y el archivo no se toca.
+    let reg = tools.registry(false);
+    let out = tools.execute(
+        reg,
+        no_servers(),
+        "write_file",
+        `{"path":"/tmp/raycode_should_not_exist.txt","content":"x"}`
+    );
+    assert(out.contains("outside the workspace"));
+    assert(!fs.exists("/tmp/raycode_should_not_exist.txt"));
+}
+
+// ---------------------------------------------------------------- herramientas nuevas
+
+@test
+fn an_edit_must_name_exactly_one_place() {
+    let path = "raycode_edit.tmp";
+    let _w = fs.write_file(path, "one\ntwo\nthree\ntwo\n");
+    let reg = tools.registry(false);
+    // Ninguna vez: casi siempre es que el modelo lo escribió de memoria.
+    let missing = tools.execute(
+        reg,
+        no_servers(),
+        "edit_file",
+        `{"path":"raycode_edit.tmp","find":"four","replace":"x"}`
+    );
+    assert(missing.contains("not in"));
+    // Varias: no ha dicho cuál, y adivinar es lo único que no se puede hacer.
+    let twice = tools.execute(
+        reg,
+        no_servers(),
+        "edit_file",
+        `{"path":"raycode_edit.tmp","find":"two","replace":"x"}`
+    );
+    assert(twice.contains("appears 2 times"));
+    // El archivo sigue como estaba tras los dos rechazos.
+    assert_eq(fs.read_file(path).unwrap_or(""), "one\ntwo\nthree\ntwo\n");
+    // Una: se cambia, y el parche dice dónde cayó.
+    let done = tools.execute(reg, no_servers(), "edit_file", `{"path":"raycode_edit.tmp","find":"two
+three","replace":"TWO
+THREE"}`);
+    assert(done.contains("at line 2"));
+    assert_eq(fs.read_file(path).unwrap_or(""), "one\nTWO\nTHREE\ntwo\n");
+    let _r = fs.remove_file(path);
+}
+
+@test
+fn an_edit_outside_the_workspace_is_refused() {
+    let out = tools.execute(
+        tools.registry(false),
+        no_servers(),
+        "edit_file",
+        `{"path":"/etc/hosts","find":"localhost","replace":"nowhere"}`
+    );
+    assert(out.contains("outside the workspace"));
+}
+
+@test
+fn search_finds_where_things_are() {
+    let reg = tools.registry(false);
+    let out = tools.execute(
+        reg,
+        no_servers(),
+        "search",
+        `{"query":"pub fn unattended","path":"src"}`
+    );
+    assert(out.contains("src/permissions.ray:"));
+    // Y lo que no está, se dice sin rodeos. (Se busca en `src`: este archivo es parte del
+    // árbol, y una búsqueda de algo que solo aparece aquí se encontraría a sí misma.)
+    assert(tools
+        .execute(reg, no_servers(), "search", `{"query":"qqxzv absent token","path":"src"}`)
+        .contains("no match"));
+    // Una expresión regular rota se rechaza donde se escribe, no se manda a buscar.
+    assert(tools
+        .execute(reg, no_servers(), "search", `{"query":"[unclosed","is_regex":true}`)
+        .contains("valid regular expression"));
+}
+
+@test
+fn a_command_says_which_files_it_changed() {
+    let before = ["M  src/a.ray", "?? notes.md"];
+    let after = ["M  src/a.ray", "M  src/b.ray"];
+    let changed = tools.changed_between(before, after);
+    // Lo que apareció, y lo que dejó de aparecer: las dos cosas pasaron.
+    assert(changed.contains("src/b.ray"));
+    assert(changed.contains("notes.md"));
+    assert(!changed.contains("src/a.ray"));
+    // Un renombrado se cuenta por su destino.
+    assert(tools.changed_between([], ["R  old.ray -> new.ray"]).contains("new.ray"));
+}
+
+// ---------------------------------------------------------------- permisos
+
+@test
+fn an_mcp_tool_is_only_unattended_when_its_server_says_so() {
+    // Lo que el servidor no declara de solo lectura entra como lo más peligroso que hay.
+    let reply = `{"tools":[{"name":"peek","description":"look","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}},{"name":"poke","description":"change","inputSchema":{"type":"object"}}]}`;
+    let parsed = match (json.parse(reply)) {
+        Result.Ok(j) => j,
+        Result.Err(e) => panic(e),
+    };
+    match (mcp.parse_tools(parsed)) {
+        Result.Ok(list) => {
+            assert_eq(list.len(), 2);
+            assert(list[0].read_only);
+            assert(!list[1].read_only);
+        },
+        Result.Err(e) => panic(e),
+    }
 }
 
 // ---------------------------------------------------------------- mcp
