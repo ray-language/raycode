@@ -76,8 +76,14 @@ pub fn inlines(items: [Inline]) -> string {
             Inline.Code(t) => ui.cyan(t),
             Inline.Emph(inner) => ui.italic(inlines(inner)),
             Inline.Strong(inner) => ui.bold(inlines(inner)),
-            Inline.Link(label, href) => ui.underline(inlines(label)) + ui.dim(" (${href})"),
-            Inline.Image(alt, src) => ui.dim("[image] ") + alt + ui.dim(" (${src})"),
+            Inline.Link(label, href, _title) => ui.underline(inlines(label)) + ui.dim(" (${href})"),
+            Inline.Image(alt, src, _title) => ui.dim("[image] ") + alt + ui.dim(" (${src})"),
+            Inline.Strike(inner) => ui.strike(inlines(inner)),
+            // Un salto duro es un salto: el bloque se junta con "\n" más abajo.
+            Inline.HardBreak => "\n",
+            // La casilla de una lista de tareas, que llega como el primer inline del ítem.
+            Inline.Check(done) => if (done) { ui.green("[x]") + " " } else { ui.dim("[ ]") + " " },
+            Inline.FootnoteRef(label) => ui.dim("[^${label}]"),
         };
     }
     out
@@ -185,6 +191,26 @@ fn block_lines(b: Block, width: int) -> [string] {
         },
         Block.List(ordered, start, items) => list_lines(ordered, start, items, width),
         Block.Table(aligns, header, rows) => table_lines(aligns, header, rows, width),
+        // Un párrafo sin su aire: lo que trae un ítem de lista apretado.
+        Block.Plain(content) => wrap(inlines(content), width, ""),
+        // > [!NOTE] y sus hermanas: una cita con el tipo por encabezado.
+        Block.Alert(kind, inner) => {
+            var lines: [string] = [];
+            lines.push(ui.bold(ui.yellow(kind.to_upper())));
+            for line in blocks_lines(inner, width - 2, true) {
+                lines.push(if (line == "") { ui.dim("▌") } else { ui.dim("▌ ") + line });
+            }
+            lines
+        },
+        // La nota al pie, bajo su marca.
+        Block.FootnoteDef(label, inner) => {
+            var lines: [string] = [];
+            lines.push(ui.dim("[^${label}]"));
+            for line in blocks_lines(inner, width - 2, true) {
+                lines.push("  " + line);
+            }
+            lines
+        },
     }
 }
 

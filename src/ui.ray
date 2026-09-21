@@ -53,6 +53,8 @@ pub fn underline(s: string) -> string { paint("4", s) }
 
 pub fn inverse(s: string) -> string { paint("7", s) }
 
+pub fn strike(s: string) -> string { paint("9", s) }
+
 /// A horizontal rule of `width` box-drawing characters.
 pub fn rule(width: int) -> string {
     dim("─".repeat(width))
