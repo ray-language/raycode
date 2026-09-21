@@ -181,9 +181,8 @@ fn path_candidates(word: string) -> [string] {
         Result.Ok(entries) => {
             for entry in entries {
                 // Los ocultos solo aparecen si se pidieron con un punto explícito.
-                if (entry.starts_with(
-                prefix
-            ) && (!entry.starts_with(".") || prefix.starts_with("."))) {
+                if (entry.starts_with(prefix)
+                    && (!entry.starts_with(".") || prefix.starts_with("."))) {
                     let full = dir + entry;
                     if (fs.is_dir(ui.resolve_path(full))) {
                         out.push(full + "/");
@@ -226,10 +225,9 @@ pub fn common_prefix(items: [string]) -> string {
     var prefix = items[0];
     for item in items {
         var i = 0;
-        while (i < prefix.len() && i < item.len() && prefix.substring(
-            i,
-            i + 1
-        ) == item.substring(i, i + 1)) {
+        while (i < prefix.len()
+            && i < item.len()
+            && prefix.substring(i, i + 1) == item.substring(i, i + 1)) {
             i = i + 1;
         }
         prefix = prefix.substring(0, i);
@@ -322,8 +320,8 @@ pub fn read_line(e: Editor, prompt: string, commands: [string]) -> Option<string
     }
     // `term.raw` devuelve el modo anterior pase lo que pase dentro (y al salir el proceso).
     match (term.raw(fn() -> Option<string> {
-    edit(e, prompt, commands)
-})) {
+        edit(e, prompt, commands)
+    })) {
         Result.Ok(line) => line,
         Result.Err(_) => {
             // Sin modo crudo no hay edición posible: se lee la línea a pelo.
@@ -425,9 +423,11 @@ fn edit(e: Editor, prompt: string, commands: [string]) -> Option<string> {
                         let options = candidates(line, cursor, commands);
                         if (options.len() == 1) {
                             let single = options[0];
-                            let completed = if (single.ends_with(
-                                "/"
-                            )) { single } else { single + " " };
+                            let completed = if (single.ends_with("/")) {
+                                single
+                            } else {
+                                single + " "
+                            };
                             line = replace_word(line, cursor, completed);
                             cursor = word_start(line, cursor) + completed.len();
                             row = redraw(prompt, line, cursor, width, row);
@@ -499,7 +499,11 @@ fn edit(e: Editor, prompt: string, commands: [string]) -> Option<string> {
                     Key.Down => {
                         if (index < e.history.len()) {
                             index = index + 1;
-                            line = if (index == e.history.len()) { stash } else { e.history[index] };
+                            line = if (index == e.history.len()) {
+                                stash
+                            } else {
+                                e.history[index]
+                            };
                             cursor = line.len();
                             row = redraw(prompt, line, cursor, width, row);
                         }

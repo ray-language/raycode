@@ -405,13 +405,11 @@ pub fn assembled(a: Assembly) -> Reply {
             blocks.push(obj(["type", "text"], [jstr("text"), jstr(b.text)]));
         } else if (b.kind == "tool_use") {
             let arguments = if (b.json.trim() == "") { "{}" } else { b.json };
-            calls.push(
-                ToolCall { id: if (b.id == "") {
-                    "call_${calls.len()}"
-                } else {
-                    b.id
-                }, name: b.name, arguments: arguments }
-            );
+            calls.push(ToolCall { id: if (b.id == "") {
+                "call_${calls.len()}"
+            } else {
+                b.id
+            }, name: b.name, arguments: arguments });
             blocks.push(
                 obj(
                     ["type", "id", "name", "input"],
