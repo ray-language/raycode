@@ -28,7 +28,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   # The raylang toolchain release to build with (https://github.com/ray-language/raylang/releases).
-  RAYLANG_VERSION: v1.6.4
+  RAYLANG_VERSION: v1.27.11
 
 jobs:
   # Create (or reuse, if it already exists) the tag's Release, with generated notes.
