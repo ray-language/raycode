@@ -352,6 +352,8 @@ bloque se puede copiar tal cual:
 }
 ```
 
+El archivo se edita a mano, así que admite comentarios (`//`, `/* */`) y comas finales.
+
 Campos por servidor: `command`, `args`, `env`, `dir` (relativo al espacio de trabajo)
 y `disabled` para un servidor por stdio; `url` y `headers` (un `Authorization`, por
 ejemplo) para uno remoto por HTTP:
@@ -473,7 +475,7 @@ Entorno: `RAYCODE_PROFILE`, `RAYCODE_BASE_URL`, `RAYCODE_MODEL`, `RAYCODE_API_KE
 | `.github/workflows/release.yml` | compila y publica los binarios al empujar un tag `v*` |
 
 Dependencia externa única: el paquete `net` de raylang (para `net/http`), declarado
-por ruta en `ray.toml`. Todo lo demás sale de la **biblioteca estándar de raylang**, no
+desde el registro en `ray.toml` (`net = "^0.3.3"`) y fijado en `ray.lock`. Todo lo demás sale de la **biblioteca estándar de raylang**, no
 de código propio ni de terceros: `std/markdown` parsea la respuesta del modelo (aquí
 solo se pinta el AST), `std/term` da el modo crudo, la decodificación de teclas y el
 tamaño de la ventana, `std/io` la lectura con plazo, y `std/json`, `std/process`,

@@ -86,15 +86,14 @@ fn cap(s: string) -> string {
 fn read_capped(path: string) -> Result<string, string> {
     let handle = fs.open(path, "r")?;
     var data = b"";
-    var reading = true;
-    while (reading && data.len() < MAX_READ) {
+    while (data.len() < MAX_READ) {
         match (fs.read_bytes(handle, READ_CHUNK)) {
             Result.Ok(chunk) => match (chunk) {
                 Option.Some(piece) => {
                     data = data + piece;
                 },
                 Option.None => {
-                    reading = false;
+                    break;
                 },
             },
             Result.Err(e) => {
@@ -173,15 +172,14 @@ fn occurrences(text: string, needle: string) -> int {
     }
     var count = 0;
     var from = 0;
-    var looking = true;
-    while (looking) {
+    while (true) {
         match (text.substring(from, text.len()).index_of(needle)) {
             Option.Some(at) => {
                 count = count + 1;
                 from = from + at + needle.len();
             },
             Option.None => {
-                looking = false;
+                break;
             },
         }
     }
@@ -456,8 +454,7 @@ fn tool_run_command(a: Json) -> Result<string, string> {
         p.kill(true);
     });
     var captured = b"";
-    var draining = true;
-    while (draining) {
+    while (true) {
         match (recv(p.out)) {
             Option.Some(chunk) => {
                 // Se sigue drenando aunque ya no se guarde: cortar el canal frenaría al hijo.
@@ -466,7 +463,7 @@ fn tool_run_command(a: Json) -> Result<string, string> {
                 }
             },
             Option.None => {
-                draining = false;
+                break;
             },
         }
     }

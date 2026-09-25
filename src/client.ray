@@ -220,16 +220,12 @@ fn seconds_in_message(message: string) -> float {
     };
     let rest = message.substring(at + mark.len(), message.len());
     var number = "";
-    var reading = true;
     for ch in rest.chars() {
-        if (reading) {
-            let code = char_code(ch);
-            if ((code >= 48 && code <= 57) || (ch == '.' && !number.contains("."))) {
-                number = number + "${ch}";
-            } else {
-                reading = false;
-            }
+        let code = char_code(ch);
+        if (!((code >= 48 && code <= 57) || (ch == '.' && !number.contains(".")))) {
+            break;
         }
+        number = number + "${ch}";
     }
     match (parse_float(number)) {
         Option.Some(n) => n,
@@ -472,19 +468,13 @@ fn send_stream_once(
 // Lo que quede del cuerpo, para poder explicar un error del proveedor.
 fn drain(stream: http.Stream) -> string {
     var acc: bytes = b"";
-    var reading = true;
-    while (reading && acc.len() < 4096) {
+    while (acc.len() < 4096) {
         match (http.stream_read(stream)) {
-            Result.Ok(chunk) => match (chunk) {
-                Option.Some(part) => {
-                    acc = acc + part;
-                },
-                Option.None => {
-                    reading = false;
-                },
+            Result.Ok(Option.Some(part)) => {
+                acc = acc + part;
             },
-            Result.Err(_) => {
-                reading = false;
+            _ => {
+                break;
             },
         }
     }
@@ -503,10 +493,8 @@ fn stream_responses(stream: http.Stream, paint: fn(string) -> unit) -> Result<Re
     var acc: bytes = b"";
     var whole: bytes = b"";
     var events = 0;
-    var reading = true;
-    while (reading) {
-        var decoding = true;
-        while (decoding) {
+    while (true) {
+        while (true) {
             match (sse.decode(acc)) {
                 Option.Some(decoded) => {
                     acc = acc.sub_bytes(decoded.1, acc.len());
@@ -517,7 +505,7 @@ fn stream_responses(stream: http.Stream, paint: fn(string) -> unit) -> Result<Re
                     }
                 },
                 Option.None => {
-                    decoding = false;
+                    break;
                 },
             }
         }
@@ -528,7 +516,7 @@ fn stream_responses(stream: http.Stream, paint: fn(string) -> unit) -> Result<Re
                     whole = whole + part;
                 },
                 Option.None => {
-                    reading = false;
+                    break;
                 },
             },
             Result.Err(e) => {
@@ -555,10 +543,8 @@ fn stream_openai(stream: http.Stream, paint: fn(string) -> unit) -> Result<Reply
     // en vez de devolver una respuesta en blanco.
     var whole: bytes = b"";
     var events = 0;
-    var reading = true;
-    while (reading) {
-        var decoding = true;
-        while (decoding) {
+    while (true) {
+        while (true) {
             match (sse.decode(acc)) {
                 Option.Some(decoded) => {
                     acc = acc.sub_bytes(decoded.1, acc.len());
@@ -569,7 +555,7 @@ fn stream_openai(stream: http.Stream, paint: fn(string) -> unit) -> Result<Reply
                     }
                 },
                 Option.None => {
-                    decoding = false;
+                    break;
                 },
             }
         }
@@ -580,7 +566,7 @@ fn stream_openai(stream: http.Stream, paint: fn(string) -> unit) -> Result<Reply
                     whole = whole + part;
                 },
                 Option.None => {
-                    reading = false;
+                    break;
                 },
             },
             Result.Err(e) => {
@@ -608,10 +594,8 @@ fn stream_anthropic(stream: http.Stream, paint: fn(string) -> unit) -> Result<Re
     // en vez de devolver una respuesta en blanco.
     var whole: bytes = b"";
     var events = 0;
-    var reading = true;
-    while (reading) {
-        var decoding = true;
-        while (decoding) {
+    while (true) {
+        while (true) {
             match (sse.decode(acc)) {
                 Option.Some(decoded) => {
                     acc = acc.sub_bytes(decoded.1, acc.len());
@@ -622,7 +606,7 @@ fn stream_anthropic(stream: http.Stream, paint: fn(string) -> unit) -> Result<Re
                     }
                 },
                 Option.None => {
-                    decoding = false;
+                    break;
                 },
             }
         }
@@ -633,7 +617,7 @@ fn stream_anthropic(stream: http.Stream, paint: fn(string) -> unit) -> Result<Re
                     whole = whole + part;
                 },
                 Option.None => {
-                    reading = false;
+                    break;
                 },
             },
             Result.Err(e) => {

@@ -1409,6 +1409,23 @@ fn mcp_config_follows_the_standard_envelope() {
 }
 
 @test
+fn mcp_config_takes_comments_and_trailing_commas() {
+    let text = `{
+    // the language server, for the agent
+    "mcpServers": {
+        "raylang": { "command": "ray", "args": ["mcp",], },
+    },
+}`;
+    match (mcp.parse_config(text)) {
+        Result.Err(e) => panic(e),
+        Result.Ok(servers) => {
+            assert_eq(servers.len(), 1);
+            assert_eq(mcp.command_line(servers[0]), "ray mcp");
+        },
+    }
+}
+
+@test
 fn mcp_handshake_and_requests_are_json_lines() {
     let lines = mcp.handshake().trim().split("\n");
     assert_eq(lines.len(), 2);

@@ -279,8 +279,9 @@ fn parse_server(name: string, spec: Json) -> Result<Server, string> {
 
 /// Parses the standard `{"mcpServers": {name: {command, args, env, dir, disabled}}}`
 /// envelope (the one Claude Code and Claude Desktop use, so a block can be pasted as is).
+/// The file is edited by hand, so `//` and `/* */` comments and trailing commas are accepted.
 pub fn parse_config(text: string) -> Result<[Server], string> {
-    let root = json.parse(text)?;
+    let root = json.parse_relaxed(text)?;
     let table = match (json.get_object(root, "mcpServers")) {
         Option.Some(t) => t,
         Option.None => {
@@ -561,15 +562,7 @@ struct Live {
 // Deja pasar stderr sin guardarlo: si nadie lo lee, el canal acotado se llena y el
 // servidor se bloquea escribiendo un log.
 fn discard(channel: Channel<bytes>) {
-    var draining = true;
-    while (draining) {
-        match (recv(channel)) {
-            Option.Some(_) => { },
-            Option.None => {
-                draining = false;
-            },
-        }
-    }
+    while (recv(channel).is_some()) { }
 }
 
 fn exit_label(code: process.Exit) -> string {
@@ -606,11 +599,10 @@ fn bury(live: Live) {
 fn await_reply(live: Live, id: int, timeout_ms: int) -> Result<Json, string> {
     let deadline = time.monotonic() + timeout_ms;
     while (true) {
-        var scanning = true;
-        while (scanning) {
+        while (true) {
             match (take_line(live)) {
                 Option.None => {
-                    scanning = false;
+                    break;
                 },
                 Option.Some(line) => {
                     if (line.trim() != "") {
@@ -740,11 +732,10 @@ fn hang_up(live: Live) {
 // parar; un servidor caído se relanza en la siguiente petición.
 fn serve(s: Server) {
     var live: Option<Live> = Option.None;
-    var serving = true;
-    while (serving) {
+    while (true) {
         match (recv(s.link)) {
             Option.None => {
-                serving = false;
+                break;
             },
             Option.Some(req) => match (req) {
                 Request.Stop(ack) => {
@@ -753,8 +744,8 @@ fn serve(s: Server) {
                         Option.None => { },
                     }
                     live = Option.None;
-                    serving = false;
                     send(ack, 1);
+                    break;
                 },
                 Request.Ask(method, params, timeout_ms, reply) => {
                     let ready: Result<Live, string> = match (live) {
@@ -1020,11 +1011,10 @@ fn disconnect_http(s: Server, web: Web) {
 // El actor HTTP: igual que el de stdio, pero lo que posee es una sesión, no un proceso.
 fn serve_http(s: Server) {
     var web: Option<Web> = Option.None;
-    var serving = true;
-    while (serving) {
+    while (true) {
         match (recv(s.link)) {
             Option.None => {
-                serving = false;
+                break;
             },
             Option.Some(req) => match (req) {
                 Request.Stop(ack) => {
@@ -1033,15 +1023,13 @@ fn serve_http(s: Server) {
                         Option.None => { },
                     }
                     web = Option.None;
-                    serving = false;
                     send(ack, 1);
+                    break;
                 },
                 Request.Ask(method, params, timeout_ms, reply) => {
-                    var attempts = 0;
+                    // Dos intentos: el segundo solo si el servidor dio la sesión por caducada.
                     var outcome: Result<Answer, string> = Result.Err("not attempted");
-                    var retrying = true;
-                    while (retrying && attempts < 2) {
-                        attempts = attempts + 1;
+                    for _ in 0..2 {
                         let ready: Result<Web, string> = match (web) {
                             Option.Some(w) => Result.Ok(w),
                             Option.None => connect_http(s, timeout_ms),
@@ -1049,21 +1037,20 @@ fn serve_http(s: Server) {
                         match (ready) {
                             Result.Err(e) => {
                                 outcome = Result.Err(e);
-                                retrying = false;
+                                break;
                             },
                             Result.Ok(w) => {
                                 web = Option.Some(w);
                                 outcome = exchange_http(s, w, method, params, timeout_ms);
                                 match (outcome) {
                                     Result.Err(e) => {
-                                        if (e == SESSION_EXPIRED) {
-                                            web = Option.None;
-                                        } else {
-                                            retrying = false;
+                                        if (e != SESSION_EXPIRED) {
+                                            break;
                                         }
+                                        web = Option.None;
                                     },
                                     Result.Ok(_) => {
-                                        retrying = false;
+                                        break;
                                     },
                                 }
                             },
