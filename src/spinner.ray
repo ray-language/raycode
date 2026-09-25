@@ -5,9 +5,8 @@
 // turno al dibujante. Ojo: `process.run` (sin streaming) NO aparca, y por eso la
 // herramienta de shell usa `stream()`.
 //
-// Sin canal con espera limitada, el pulso se arma con una fibra por cuadro que duerme y
-// avisa: `select([stop, tick])` despierta con lo que llegue antes, la orden de parar o el
-// siguiente cuadro.
+// El pulso es `select_timeout([stop], FRAME_MS)`: despierta con la orden de parar o, pasado
+// el plazo, toca dibujar el siguiente cuadro.
 import std/time;
 import src/ui;
 
@@ -42,21 +41,11 @@ pub fn start(label: string) -> Spinner {
         let started = time.monotonic();
         let art = frames();
         var frame = 0;
-        var spinning = true;
-        while (spinning) {
-            let tick: Channel<int> = Channel.new();
-            spawn(fn() {
-                time.sleep(FRAME_MS);
-                send(tick, 1);
-            });
-            if (select([stop, tick]) == 0) {
-                spinning = false;
-            } else {
-                let elapsed = ui.fmt_millis(time.monotonic() - started);
-                let glyph = art[frame - frame / art.len() * art.len()];
-                ui.write_inline("\r" + ui.erase_line() + ui.dim("${glyph} ${label} ${elapsed}"));
-                frame = frame + 1;
-            }
+        while (select_timeout([stop], FRAME_MS).is_none()) {
+            let elapsed = ui.fmt_millis(time.monotonic() - started);
+            let glyph = art[frame % art.len()];
+            ui.write_inline("\r" + ui.erase_line() + ui.dim("${glyph} ${label} ${elapsed}"));
+            frame = frame + 1;
         }
         erase();
         // El aviso de vuelta evita que el llamador escriba antes de que la línea se borre.

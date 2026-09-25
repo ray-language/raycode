@@ -26,7 +26,6 @@ import std/term;
 import std/io;
 from std/term import Key;
 import src/ui;
-import std/time;
 import std/json;
 from std/json import Json;
 
@@ -146,34 +145,26 @@ fn cancels(chunk: bytes) -> bool {
 }
 
 // Vigila el teclado mientras otra fibra trabaja. El sondeo es puro (plazo 0: no aparca) y
-// el pulso lo pone una fibra que duerme, para poder atender también la orden de parar:
-// `select` sobre [parar, pulso].
+// el pulso lo marca `select_timeout` sobre la orden de parar: despierta con ella o, pasado
+// el plazo, toca sondear otra vez.
 fn watch_keys(events: Channel<Signal>, stop: Channel<int>) {
-    var watching = true;
-    while (watching) {
-        let tick: Channel<int> = Channel.new();
-        spawn(fn() {
-            time.sleep(POLL_MS);
-            send(tick, 1);
-        });
-        if (select([stop, tick]) == 0) {
-            watching = false;
-        } else {
-            match (io.read_timeout(64, 0)) {
-                io.ReadResult.Data(chunk) => {
-                    if (cancels(chunk)) {
-                        send(events, Signal.Cancelled);
-                        watching = false;
-                    } else {
-                        // Lo que no es parar se guarda: es el principio de la siguiente línea.
-                        send(events, Signal.Typed(chunk));
-                    }
-                },
-                io.ReadResult.Eof => {
-                    watching = false;
-                },
-                io.ReadResult.TimedOut => { },
-            }
+    while (true) {
+        if (select_timeout([stop], POLL_MS).is_some()) {
+            break;
+        }
+        match (io.read_timeout(64, 0)) {
+            io.ReadResult.Data(chunk) => {
+                if (cancels(chunk)) {
+                    send(events, Signal.Cancelled);
+                    break;
+                }
+                // Lo que no es parar se guarda: es el principio de la siguiente línea.
+                send(events, Signal.Typed(chunk));
+            },
+            io.ReadResult.Eof => {
+                break;
+            },
+            io.ReadResult.TimedOut => { },
         }
     }
 }
@@ -182,19 +173,18 @@ fn watch_keys(events: Channel<Signal>, stop: Channel<int>) {
 // tecleado entre medias se guarda en la sesión.
 fn wait_for(s: Session, signals: Channel<Signal>, stop: Channel<int>) -> bool {
     var cancelled = false;
-    var waiting = true;
-    while (waiting) {
+    while (true) {
         match (recv(signals)) {
             Option.None => {
-                waiting = false;
+                break;
             },
             Option.Some(what) => match (what) {
                 Signal.Cancelled => {
                     cancelled = true;
-                    waiting = false;
+                    break;
                 },
                 Signal.Done => {
-                    waiting = false;
+                    break;
                 },
                 Signal.Typed(keys) => {
                     s.typeahead = s.typeahead + keys;
@@ -254,11 +244,10 @@ fn call_model(s: Session, label: string, width: int, raw: bool, watch: bool) -> 
     var spinning = true;
     var cancelled = false;
     let brush = painter(width, raw);
-    var listening = true;
-    while (listening) {
+    while (true) {
         match (recv(signals)) {
             Option.None => {
-                listening = false;
+                break;
             },
             Option.Some(signal) => match (signal) {
                 Signal.Text(piece) => {
@@ -273,11 +262,11 @@ fn call_model(s: Session, label: string, width: int, raw: bool, watch: bool) -> 
                     s.typeahead = s.typeahead + keys;
                 },
                 Signal.Done => {
-                    listening = false;
+                    break;
                 },
                 Signal.Cancelled => {
                     cancelled = true;
-                    listening = false;
+                    break;
                 },
             },
         }
@@ -419,27 +408,24 @@ fn ask_user(s: Session, call: ToolCall, command: string) -> string {
 // —vive dentro de cada paso, no entre ellos—, así que aquí no hay quien compita por la
 // entrada. Se sondea en tramos para que un EOF no se quede colgado.
 fn read_key() -> string {
-    var waiting = true;
-    var key = "";
-    while (waiting) {
+    while (true) {
         match (io.read_timeout(64, 60000)) {
             io.ReadResult.Data(chunk) => {
                 // El primer octeto del trozo: una flecha llega como varios y no es
                 // ninguna de las respuestas, así que basta con mirar por dónde empieza.
-                key = if (chunk.len() > 0) {
+                return if (chunk.len() > 0) {
                     from_utf8(chunk.sub_bytes(0, 1)).unwrap_or("")
                 } else {
                     ""
                 };
-                waiting = false;
             },
             io.ReadResult.Eof => {
-                waiting = false;
+                return "";
             },
             io.ReadResult.TimedOut => { },
         }
     }
-    key
+    ""
 }
 
 // La etiqueta del indicador, con el recordatorio de que se puede parar.
