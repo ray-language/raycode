@@ -1,6 +1,7 @@
 # Build output: the native binary is produced by `ray build --native` and shipped
 # through the GitHub Release, never committed.
 /bin/raycode
+/raycode
 /dist/
 
 # Dependencies fetched by `ray fetch`.
