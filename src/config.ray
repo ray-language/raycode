@@ -156,9 +156,7 @@ fn preset(profile: string) -> Result<Config, string> {
             // se aplican —van al espacio de trabajo y a ningún otro sitio, que es lo que
             // garantiza `src/paths`— y los mandatos siguen necesitando que se digan.
             permissions.ASK
-        } else {
-            permissions.EDITS
-        }),
+        } else { permissions.EDITS }),
         allowed_programs: allowed_from_env(),
         allowed_tools: [],
         mode: env_or("RAYCODE_MODE", modes.AGENT),

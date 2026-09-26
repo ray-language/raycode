@@ -2,6 +2,7 @@
 name = "raycode"
 version = "0.3.1"
 entry = "main.ray"
+raylang = "1.27.13"
 
 [dependencies]
-net = "^0.3.3"
+net = "^0.3.7"

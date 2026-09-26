@@ -79,7 +79,6 @@ pub fn send(c: Config, tools: [Tool], history: [Message]) -> Result<Reply, strin
             },
         }
     }
-    Result.Err("unreachable")
 }
 
 /// How many times a request is tried before its failure is reported.
@@ -427,7 +426,6 @@ pub fn send_stream(
             },
         }
     }
-    Result.Err("unreachable")
 }
 
 fn send_stream_once(
@@ -473,9 +471,7 @@ fn drain(stream: http.Stream) -> string {
             Result.Ok(Option.Some(part)) => {
                 acc = acc + part;
             },
-            _ => {
-                break;
-            },
+            _ => break,
         }
     }
     http.stream_close(stream);
@@ -504,9 +500,7 @@ fn stream_responses(stream: http.Stream, paint: fn(string) -> unit) -> Result<Re
                         paint(piece);
                     }
                 },
-                Option.None => {
-                    break;
-                },
+                Option.None => break,
             }
         }
         match (http.stream_read(stream)) {
@@ -515,9 +509,7 @@ fn stream_responses(stream: http.Stream, paint: fn(string) -> unit) -> Result<Re
                     acc = acc + part;
                     whole = whole + part;
                 },
-                Option.None => {
-                    break;
-                },
+                Option.None => break,
             },
             Result.Err(e) => {
                 return Result.Err("error reading the stream: ${e}");
@@ -554,9 +546,7 @@ fn stream_openai(stream: http.Stream, paint: fn(string) -> unit) -> Result<Reply
                         paint(piece);
                     }
                 },
-                Option.None => {
-                    break;
-                },
+                Option.None => break,
             }
         }
         match (http.stream_read(stream)) {
@@ -565,9 +555,7 @@ fn stream_openai(stream: http.Stream, paint: fn(string) -> unit) -> Result<Reply
                     acc = acc + part;
                     whole = whole + part;
                 },
-                Option.None => {
-                    break;
-                },
+                Option.None => break,
             },
             Result.Err(e) => {
                 return Result.Err("error reading the stream: ${e}");
@@ -605,9 +593,7 @@ fn stream_anthropic(stream: http.Stream, paint: fn(string) -> unit) -> Result<Re
                         paint(piece);
                     }
                 },
-                Option.None => {
-                    break;
-                },
+                Option.None => break,
             }
         }
         match (http.stream_read(stream)) {
@@ -616,9 +602,7 @@ fn stream_anthropic(stream: http.Stream, paint: fn(string) -> unit) -> Result<Re
                     acc = acc + part;
                     whole = whole + part;
                 },
-                Option.None => {
-                    break;
-                },
+                Option.None => break,
             },
             Result.Err(e) => {
                 return Result.Err("error reading the stream: ${e}");

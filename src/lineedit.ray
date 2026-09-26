@@ -147,30 +147,17 @@ fn emit(s: string) {
     ui.write_inline(s);
 }
 
-// El índice del último `needle` en `s`, o -1. (`index_of` da el primero.)
-fn last_index_of(s: string, needle: string) -> int {
-    var found = -1;
-    var i = 0;
-    while (i + needle.len() <= s.len()) {
-        if (s.substring(i, i + needle.len()) == needle) {
-            found = i;
-        }
-        i = i + 1;
-    }
-    found
-}
-
 // El inicio de la palabra que se está escribiendo (lo que hay tras el último espacio).
 fn word_start(line: string, cursor: int) -> int {
     let head = line.substring(0, cursor);
-    last_index_of(head, " ") + 1
+    head.last_index_of(" ").map(fn(i: int) -> int { i + 1 }).unwrap_or(0)
 }
 
 // Los candidatos de ruta para `word`: se lista su directorio y se filtra por el prefijo.
 // Los directorios se completan con `/` para poder seguir bajando con otro Tab.
 fn path_candidates(word: string) -> [string] {
     var out: [string] = [];
-    let cut = last_index_of(word, "/");
+    let cut = word.last_index_of("/").unwrap_or(-1);
     let dir = if (cut < 0) { "" } else { word.substring(0, cut + 1) };
     let prefix = word.substring(cut + 1, word.len());
     // Se lista el espacio de trabajo (el directorio desde el que se lanzó raycode), pero lo

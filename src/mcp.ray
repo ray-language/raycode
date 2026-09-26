@@ -269,11 +269,22 @@ fn parse_server(name: string, spec: Json) -> Result<Server, string> {
     };
     let link: Channel<Request> = Channel.new();
     Result.Ok(
-        Server { name: name, command: command, args: arguments, dir: dir, env: environment, url: url, headers: extra_headers, enabled: !disabled, note: if (disabled) {
-            "disabled in the configuration"
-        } else {
-            ""
-        }, tool_count: 0, instructions: "", resources: [], link: link, running: false }
+        Server {
+            name: name,
+            command: command,
+            args: arguments,
+            dir: dir,
+            env: environment,
+            url: url,
+            headers: extra_headers,
+            enabled: !disabled,
+            note: if (disabled) { "disabled in the configuration" } else { "" },
+            tool_count: 0,
+            instructions: "",
+            resources: [],
+            link: link,
+            running: false
+        }
     )
 }
 
@@ -601,9 +612,7 @@ fn await_reply(live: Live, id: int, timeout_ms: int) -> Result<Json, string> {
     while (true) {
         while (true) {
             match (take_line(live)) {
-                Option.None => {
-                    break;
-                },
+                Option.None => break,
                 Option.Some(line) => {
                     if (line.trim() != "") {
                         match (json.parse(line.trim())) {
@@ -643,7 +652,6 @@ fn await_reply(live: Live, id: int, timeout_ms: int) -> Result<Json, string> {
             },
         }
     }
-    Result.Err("unreachable")
 }
 
 // Escribe una línea al stdin del servidor. `write` aparca la fibra si el pipe se llena
@@ -661,11 +669,9 @@ fn write_line(live: Live, text: string) -> Result<int, string> {
 // Lanza el proceso y hace el apretón de manos.
 fn launch(s: Server, timeout_ms: int) -> Result<Live, string> {
     var command = process.cmd(s.command, s.args).stdin_pipe();
-    command = command.dir(if (s.dir.trim() == "") {
-        ui.workspace()
-    } else {
-        ui.resolve_path(s.dir)
-    });
+    command = command.dir(
+        if (s.dir.trim() == "") { ui.workspace() } else { ui.resolve_path(s.dir) }
+    );
     for k in s.env.keys() {
         match (get(s.env, k)) {
             Option.Some(v) => {
@@ -734,9 +740,7 @@ fn serve(s: Server) {
     var live: Option<Live> = Option.None;
     while (true) {
         match (recv(s.link)) {
-            Option.None => {
-                break;
-            },
+            Option.None => break,
             Option.Some(req) => match (req) {
                 Request.Stop(ack) => {
                     match (live) {
@@ -872,33 +876,28 @@ fn post(
             Posted { status: status, headers: headers, result: Result.Ok(Json.JNull) }
         );
     }
-    var reading = true;
-    while (reading) {
+    // Two loops to leave once the reply shows up: the chunk reader and the SSE decoder.
+    reading: while (true) {
         match (http.stream_read(stream)) {
             Result.Err(e) => {
                 outcome = Result.Err("reading the reply failed: ${e}");
-                reading = false;
+                break;
             },
             Result.Ok(chunk) => match (chunk) {
-                Option.None => {
-                    reading = false;
-                },
+                Option.None => break,
                 Option.Some(part) => {
                     acc = acc + part;
                     if (kind.contains("text/event-stream")) {
                         // Un evento por vez; el que lleve la `id` es la respuesta.
-                        var decoding = true;
-                        while (decoding && reading) {
+                        while (true) {
                             match (sse.decode(acc)) {
-                                Option.None => {
-                                    decoding = false;
-                                },
+                                Option.None => break,
                                 Option.Some(decoded) => {
                                     acc = acc.sub_bytes(decoded.1, acc.len());
                                     match (reply_with_id(decoded.0.data, id)) {
                                         Option.Some(found) => {
                                             outcome = found;
-                                            reading = false;
+                                            break reading;
                                         },
                                         Option.None => { },
                                     }
@@ -908,7 +907,7 @@ fn post(
                     }
                     if (acc.len() > MAX_STREAM_BYTES) {
                         outcome = Result.Err("the reply exceeds ${MAX_STREAM_BYTES} bytes");
-                        reading = false;
+                        break;
                     }
                 },
             },
@@ -953,13 +952,14 @@ fn connect_http(s: Server, timeout_ms: int) -> Result<Web, string> {
             return Result.Err("initialize failed: ${e}");
         },
     };
-    let web = Web { session_id: header_of(
-        posted.headers,
-        "mcp-session-id"
-    ), next_id: HELLO_ID + 1, instructions: match (json.get_string(result, "instructions")) {
-        Option.Some(text) => text.trim(),
-        Option.None => "",
-    } };
+    let web = Web {
+        session_id: header_of(posted.headers, "mcp-session-id"),
+        next_id: HELLO_ID + 1,
+        instructions: match (json.get_string(result, "instructions")) {
+            Option.Some(text) => text.trim(),
+            Option.None => "",
+        }
+    };
     // La notificación no tiene respuesta: un 202 (o cualquier 2xx) basta.
     match (post(s, web.session_id, lines[1], 0 - 1, timeout_ms)) {
         Result.Ok(_) => { },
@@ -1013,9 +1013,7 @@ fn serve_http(s: Server) {
     var web: Option<Web> = Option.None;
     while (true) {
         match (recv(s.link)) {
-            Option.None => {
-                break;
-            },
+            Option.None => break,
             Option.Some(req) => match (req) {
                 Request.Stop(ack) => {
                     match (web) {
@@ -1049,9 +1047,7 @@ fn serve_http(s: Server) {
                                         }
                                         web = Option.None;
                                     },
-                                    Result.Ok(_) => {
-                                        break;
-                                    },
+                                    Result.Ok(_) => break,
                                 }
                             },
                         }

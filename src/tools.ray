@@ -92,9 +92,7 @@ fn read_capped(path: string) -> Result<string, string> {
                 Option.Some(piece) => {
                     data = data + piece;
                 },
-                Option.None => {
-                    break;
-                },
+                Option.None => break,
             },
             Result.Err(e) => {
                 close(handle);
@@ -178,9 +176,7 @@ fn occurrences(text: string, needle: string) -> int {
                 count = count + 1;
                 from = from + at + needle.len();
             },
-            Option.None => {
-                break;
-            },
+            Option.None => break,
         }
     }
     count
@@ -462,9 +458,7 @@ fn tool_run_command(a: Json) -> Result<string, string> {
                     captured = captured + chunk;
                 }
             },
-            Option.None => {
-                break;
-            },
+            Option.None => break,
         }
     }
     let elapsed = time.monotonic() - started;
@@ -626,16 +620,18 @@ pub fn from_servers(servers: [Server]) -> [Tool] {
         match (mcp.discover(s, mcp.DISCOVER_TIMEOUT_MS)) {
             Result.Ok(remote) => {
                 for r in remote {
-                    tools.push(
-                        Tool { name: mcp.tool_name(s.name, r.name), description: r.description, schema: r.schema, source: s.name, risk: if (r.read_only) {
+                    tools.push(Tool {
+                        name: mcp.tool_name(s.name, r.name),
+                        description: r.description,
+                        schema: r.schema,
+                        source: s.name,
+                        risk: if (r.read_only) {
                             // Lo que el servidor no declara de solo lectura se trata como lo
                             // más peligroso que hay: nadie aquí sabe qué hace la herramienta
                             // de otro programa.
                             permissions.READ
-                        } else {
-                            permissions.EXEC
-                        } }
-                    );
+                        } else { permissions.EXEC }
+                    });
                 }
             },
             Result.Err(_) => { },
