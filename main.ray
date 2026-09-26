@@ -226,11 +226,14 @@ fn show_usage(s: agent.Session) {
     let t = s.total;
     let mark = if (usage.is_estimate(t)) { "≈" } else { "" };
     print(ui.bold("usage") + ui.dim(" · ${s.turns} turn(s), ${s.steps} request(s)"));
-    print("  input   ${mark}${ui.fmt_count(t.input_tokens)} tokens" + if (t.cached_tokens > 0) {
+    // The `if` lives in a `let`: `ray fmt` 1.27.13 splits a long `"…${x}…" + if …` chain
+    // by rewriting the interpolation as `to_string` concatenations.
+    let cached = if (t.cached_tokens > 0) {
         " (${ui.fmt_count(t.cached_tokens)} from cache)"
     } else {
         ""
-    });
+    };
+    print("  input   ${mark}${ui.fmt_count(t.input_tokens)} tokens${cached}");
     print("  output  ${mark}${ui.fmt_count(t.output_tokens)} tokens");
     print("  total   ${mark}${ui.fmt_count(usage.total_tokens(t))} tokens");
     print(
@@ -399,11 +402,15 @@ fn manage_key(s: agent.Session, rest: string) {
     }
     if (rest == "forget") {
         match (config.forget_key(c.profile)) {
-            Result.Ok(had) => print(ui.dim(if (had) {
-                "the stored key for '${c.profile}' is gone"
-            } else {
-                "there was no stored key for '${c.profile}'"
-            })),
+            Result.Ok(had) => print(
+                ui.dim(
+                    if (had) {
+                        "the stored key for '${c.profile}' is gone"
+                    } else {
+                        "there was no stored key for '${c.profile}'"
+                    }
+                )
+            ),
             Result.Err(e) => print(ui.red("! ") + "the keychain refused it: ${e}"),
         }
         return;

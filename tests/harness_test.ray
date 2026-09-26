@@ -743,16 +743,14 @@ fn a_symlink_out_of_the_workspace_is_refused() {
         Result.Err(e) => panic(e),
     };
     let _w = fs.write_file("${real_root}/inside.txt", "mine");
-    // Un enlace a /etc dentro de la carpeta. Sin `ln` no hay nada que probar aquí.
-    let made = process.cmd("ln", ["-s", "/etc", "${real_root}/escape"]).run();
-    match (made) {
-        Result.Ok(_) => {
-            match (paths.resolve_in(real_root, "escape/hosts")) {
-                Result.Ok(full) => panic("the symlink should not have resolved to ${full}"),
-                Result.Err(e) => assert(e.contains("symbolic link")),
-            }
-        },
-        Result.Err(_e) => { },
+    // Un enlace a /etc dentro de la carpeta.
+    match (fs.symlink("/etc", "${real_root}/escape")) {
+        Result.Ok(_) => { },
+        Result.Err(e) => panic(e),
+    }
+    match (paths.resolve_in(real_root, "escape/hosts")) {
+        Result.Ok(full) => panic("the symlink should not have resolved to ${full}"),
+        Result.Err(e) => assert(e.contains("symbolic link")),
     }
     // Y lo que de verdad está dentro sigue estándolo.
     match (paths.resolve_in(real_root, "inside.txt")) {

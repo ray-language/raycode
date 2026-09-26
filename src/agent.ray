@@ -161,9 +161,7 @@ fn watch_keys(events: Channel<Signal>, stop: Channel<int>) {
                 // Lo que no es parar se guarda: es el principio de la siguiente línea.
                 send(events, Signal.Typed(chunk));
             },
-            io.ReadResult.Eof => {
-                break;
-            },
+            io.ReadResult.Eof => break,
             io.ReadResult.TimedOut => { },
         }
     }
@@ -175,17 +173,13 @@ fn wait_for(s: Session, signals: Channel<Signal>, stop: Channel<int>) -> bool {
     var cancelled = false;
     while (true) {
         match (recv(signals)) {
-            Option.None => {
-                break;
-            },
+            Option.None => break,
             Option.Some(what) => match (what) {
                 Signal.Cancelled => {
                     cancelled = true;
                     break;
                 },
-                Signal.Done => {
-                    break;
-                },
+                Signal.Done => break,
                 Signal.Typed(keys) => {
                     s.typeahead = s.typeahead + keys;
                 },
@@ -246,9 +240,7 @@ fn call_model(s: Session, label: string, width: int, raw: bool, watch: bool) -> 
     let brush = painter(width, raw);
     while (true) {
         match (recv(signals)) {
-            Option.None => {
-                break;
-            },
+            Option.None => break,
             Option.Some(signal) => match (signal) {
                 Signal.Text(piece) => {
                     // El indicador dura hasta el primer token: a partir de ahí manda el texto.
@@ -261,9 +253,7 @@ fn call_model(s: Session, label: string, width: int, raw: bool, watch: bool) -> 
                 Signal.Typed(keys) => {
                     s.typeahead = s.typeahead + keys;
                 },
-                Signal.Done => {
-                    break;
-                },
+                Signal.Done => break,
                 Signal.Cancelled => {
                     cancelled = true;
                     break;
