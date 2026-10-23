@@ -5,4 +5,4 @@ entry = "main.ray"
 raylang = "1.27.13"
 
 [dependencies]
-net = "^0.3.7"
+net = "^0.11.4"
